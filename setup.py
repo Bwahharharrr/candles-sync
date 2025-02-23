@@ -11,12 +11,12 @@ except FileNotFoundError:
 setup(
     name="candles_sync",
     version="0.1.0",
-    author="Your Name",
+    author="Bwahharharrr",
     author_email="your.email@example.com",
     description="A utility to synchronize historical candle data from Bitfinex",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/candles_sync",
+    url="https://github.com/Bwahharharrr/candles-sync",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
