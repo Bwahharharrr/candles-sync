@@ -311,18 +311,18 @@ def find_missing_dates(dir_path: str, expected_start=None, expected_end=None):
 
 
 def synchronize_candle_data(exchange: str,
-                            ticker: str,
-                            timeframe: str,
-                            end_date_str: str = None,
-                            verbose: bool = False) -> bool:
+                          ticker: str,
+                          timeframe: str,
+                          end_date_str: str = None,
+                          verbose: bool = False) -> bool:
     # Add compact output at the start
     if not verbose:
         end_str = f" → {end_date_str}" if end_date_str else ""
         print(f"{INFO} Syncing {COLOR_VAR}{exchange}/{ticker}/{timeframe}{Style.RESET_ALL}{end_str}")
     else:
         print(f"\n{INFO} Running synchronization with the following parameters:\n")
-        print(f"  {COLOR_VAR}--exchange{Style.RESET_ALL}  {COLOR_TYPE}(str){Style.RESET_ALL}  {exchange}")
-        print(f"  {COLOR_VAR}--ticker{Style.RESET_ALL}    {COLOR_TYPE}(str){Style.RESET_ALL}  {ticker}")
+        print(f"  {COLOR_VAR}--exchange{Style.RESET_ALL}   {COLOR_TYPE}(str){Style.RESET_ALL}  {exchange}")
+        print(f"  {COLOR_VAR}--ticker{Style.RESET_ALL}     {COLOR_TYPE}(str){Style.RESET_ALL}  {ticker}")
         print(f"  {COLOR_VAR}--timeframe{Style.RESET_ALL} {COLOR_TYPE}(str){Style.RESET_ALL}  {timeframe}")
         if end_date_str:
             print(f"  {COLOR_VAR}--end{Style.RESET_ALL}       {COLOR_TYPE}(str){Style.RESET_ALL}  {end_date_str}")
@@ -368,8 +368,16 @@ def synchronize_candle_data(exchange: str,
             # Check for missing dates in the range
             missing_ranges = find_missing_dates(dir_path, earliest_file_date, effective_end)
             
-            if not missing_ranges and end_date:
-                # Only exit early if we have all files AND an end date was specified
+            if not missing_ranges:
+                # Even if we have all files, check if the end date file is the latest file
+                # and if so, ensure it's complete with one final API call
+                if end_date and latest_file_date == end_date:
+                    print(f"{INFO} Validating completeness of end date file {COLOR_TIMESTAMPS}{end_date}{Style.RESET_ALL}...")
+                    start_of_end_date = int(datetime.combine(end_date, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
+                    candles = fetch_bitfinex_candles(symbol=ticker, timeframe=timeframe, start=start_of_end_date, limit=10000)
+                    if candles:
+                        save_candles_to_csv(candles, dir_path, ticker, timeframe)
+                    
                 print(f"{SUCCESS} All files exist for the date range {COLOR_TIMESTAMPS}{earliest_file_date}{Style.RESET_ALL} → {COLOR_TIMESTAMPS}{effective_end}{Style.RESET_ALL}")
                 return True
             
