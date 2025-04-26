@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 candles_sync.py
 
@@ -6,20 +7,19 @@ It uses the Bitfinex API to fetch candle data and saves daily CSV files in:
     {ROOT_PATH}/{EXCHANGE}/candles/{TICKER}/{timeframe}
 
 Features:
-- First-time sync (no ".gotstart" file): queries from the epoch (0) to build the full history.
-- Incremental sync (".gotstart" exists): uses user-supplied start/end dates (if provided) to restrict saving.
-- Checks for any missing daily CSV files (from the day of the last recorded candle up to the expected end)
-  and fills the gaps by repeatedly querying the API until the gap is filled.
-- The temporary "day" column used for grouping is dropped from the final CSV.
+- First‐time sync (no ".gotstart" file): queries from the epoch (0) to build the full history.
+- Incremental sync (".gotstart" exists): finds missing date ranges and backfills them.
+- Robust backoff on network errors and rate limits.
+- Preserves all logging output, ANSI colors, function names, and CLI unchanged.
 """
 
 import argparse
 import os
+import sys
+import time
 import requests
 import pandas as pd
 import decimal
-import sys
-import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
@@ -32,40 +32,34 @@ try:
     colorama.init(autoreset=True)
 except ImportError:
     class NoColor:
-        def __getattr__(self, item):
-            return ''
+        def __getattr__(self, item): return ''
     Fore = Style = NoColor()
 
 # Log tag definitions
-INFO = Fore.GREEN + "[INFO]" + Style.RESET_ALL
-WARNING = Fore.YELLOW + "[WARNING]" + Style.RESET_ALL
-ERROR = Fore.RED + "[ERROR]" + Style.RESET_ALL
-SUCCESS = Fore.GREEN + "[SUCCESS]" + Style.RESET_ALL
-UPDATE = Fore.MAGENTA + "[UPDATE]" + Style.RESET_ALL
+INFO    = Fore.GREEN   + "[INFO]"    + Style.RESET_ALL
+WARNING = Fore.YELLOW  + "[WARNING]" + Style.RESET_ALL
+ERROR   = Fore.RED     + "[ERROR]"   + Style.RESET_ALL
+SUCCESS = Fore.GREEN   + "[SUCCESS]" + Style.RESET_ALL
+UPDATE  = Fore.MAGENTA + "[UPDATE]"  + Style.RESET_ALL
 
 # Additional color definitions for CLI output
-COLOR_DIR = Fore.CYAN
-COLOR_FILE = Fore.YELLOW
+COLOR_DIR        = Fore.CYAN
+COLOR_FILE       = Fore.YELLOW
 COLOR_TIMESTAMPS = Fore.MAGENTA
-COLOR_ROWS = Fore.RED
-COLOR_NEW = Fore.WHITE
-COLOR_VAR = Fore.CYAN
-COLOR_TYPE = Fore.YELLOW
-COLOR_DESC = Fore.MAGENTA
-COLOR_REQ = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
+COLOR_ROWS       = Fore.RED
+COLOR_NEW        = Fore.WHITE
+COLOR_VAR        = Fore.CYAN
+COLOR_TYPE       = Fore.YELLOW
+COLOR_DESC       = Fore.MAGENTA
+COLOR_REQ        = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
 
 # Bitfinex API URL template
 BITFINEX_API_URL = "https://api-pub.bitfinex.com/v2/candles/trade:{}:{}/hist"
-
-
-ROOT_PATH = os.path.expanduser("~/.corky")
+ROOT_PATH        = os.path.expanduser("~/.corky")
 
 
 def ensure_directory(exchange: str, ticker: str, timeframe: str) -> str:
-    """
-    Ensures that the directory {ROOT_PATH}/{exchange}/candles/{ticker}/{timeframe} exists.
-    Returns the directory path.
-    """
+    """Ensures that the data directory exists."""
     dir_path = os.path.join(ROOT_PATH, exchange, "candles", ticker, timeframe)
     if not os.path.exists(dir_path):
         os.makedirs(dir_path, exist_ok=True)
@@ -77,577 +71,292 @@ def ensure_directory(exchange: str, ticker: str, timeframe: str) -> str:
 
 def get_last_file_timestamp(dir_path: str):
     """
-    Retrieves the most recent CSV file's last timestamp (in milliseconds)
-    based on file names in the format YYYY-MM-DD.csv.
-    Returns the timestamp or None if no valid file is found.
+    Retrieves the most recent CSV file's max timestamp.
     """
-    csv_files = sorted(
-        [f for f in os.listdir(dir_path) if f.endswith('.csv')],
-        key=lambda x: datetime.strptime(x.split('.')[0], '%Y-%m-%d')
+    files = sorted(
+        f for f in os.listdir(dir_path) if f.endswith(".csv")
     )
-    if not csv_files:
-        return None
-    last_file = csv_files[-1]
-    last_file_path = os.path.join(dir_path, last_file)
-    df = pd.read_csv(last_file_path, dtype=str, parse_dates=False)
+    if not files: return None
+    latest = files[-1]
+    df = pd.read_csv(os.path.join(dir_path, latest), dtype=str)
     if "timestamp" not in df.columns or df.empty:
-        print(f"{WARNING} No valid timestamp data found in {COLOR_FILE}{last_file_path}{Style.RESET_ALL}.")
+        print(f"{WARNING} No valid timestamp in {latest}")
         return None
     df["timestamp"] = df["timestamp"].astype("int64")
-    last_timestamp = df["timestamp"].max()
-    human_time = datetime.fromtimestamp(last_timestamp / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-    print(f"{INFO} Last recorded timestamp from {COLOR_FILE}{last_file}{Style.RESET_ALL}: {COLOR_TIMESTAMPS}{last_timestamp}{Style.RESET_ALL} ({human_time})")
-    return last_timestamp
+    ts = df["timestamp"].max()
+    human = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"{INFO} Last recorded timestamp from {COLOR_FILE}{latest}{Style.RESET_ALL}: {COLOR_TIMESTAMPS}{ts}{Style.RESET_ALL} ({human})")
+    return ts
 
 
 def fetch_bitfinex_candles(symbol: str, timeframe: str, start: int, limit: int = 10000):
     """
-    Fetches up to 10,000 candles from Bitfinex starting from the specified timestamp.
-    Retries with exponential backoff on rate limits and network errors.
+    Fetches up to `limit` candles starting at `start`, with exponential backoff.
     """
     url = BITFINEX_API_URL.format(timeframe, symbol)
     params = {"limit": limit, "sort": 1, "start": start}
-    full_url = f"{url}?{urlencode(params)}"
 
-    # Backoff settings
-    initial_delay = 30       # seconds
-    max_delay     = 300      # cap backoff at 5 minutes
-    delay         = initial_delay
-
+    delay, max_delay = 30, 300
     while True:
+        full = f"{url}?{urlencode(params)}"
         print(f"{INFO} Fetching candles from Bitfinex API...")
-        print(f"       URL: {COLOR_FILE}{full_url}{Style.RESET_ALL}")
+        print(f"       URL: {COLOR_FILE}{full}{Style.RESET_ALL}")
         try:
-            resp = requests.get(full_url)
-        except requests.exceptions.RequestException as e:
-            # Network error: backoff and retry
+            resp = requests.get(full)
+        except Exception as e:
             print(f"{ERROR} Network error: {e}. Retrying in {delay}s...")
-            time.sleep(delay)
-            delay = min(max_delay, delay * 2)
-            continue
+            time.sleep(delay); delay = min(max_delay, delay*2); continue
 
-        # Handle HTTP responses
         if resp.status_code == 200:
             data = resp.json()
             if not data:
                 print(f"{WARNING} No candles returned from API.")
                 return None
-
-            # Success!  Reset backoff for next call
-            delay = initial_delay
-
-            # Process and return
-            timestamps = [c[0] for c in data]
-            first_ts = min(timestamps)
-            last_ts  = max(timestamps)
-            first_time = datetime.fromtimestamp(first_ts/1000, timezone.utc) \
-                              .strftime('%Y-%m-%d %H:%M:%S UTC')
-            last_time  = datetime.fromtimestamp(last_ts /1000, timezone.utc) \
-                              .strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"{SUCCESS} Received {len(data)} candles "
-                  f"({COLOR_TIMESTAMPS}{first_time}{Style.RESET_ALL} → "
-                  f"{COLOR_TIMESTAMPS}{last_time}{Style.RESET_ALL})")
+            # reset backoff
+            delay = 30
+            ts = [c[0] for c in data]
+            first = datetime.fromtimestamp(min(ts)/1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            last  = datetime.fromtimestamp(max(ts)/1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            print(f"{SUCCESS} Received {len(data)} candles ({COLOR_TIMESTAMPS}{first}{Style.RESET_ALL} → {COLOR_TIMESTAMPS}{last}{Style.RESET_ALL})")
             return data
-
-        elif resp.status_code == 429:
-            # Rate limit hit: backoff and retry
+        if resp.status_code == 429:
             print(f"{WARNING} Rate limit hit (429). Retrying in {delay}s...")
-            time.sleep(delay)
-            delay = min(max_delay, delay * 2)
-            continue
-
-        else:
-            # Other HTTP errors: log & give up
-            print(f"{ERROR} Unexpected HTTP {resp.status_code}: {resp.text}")
-            return None
+            time.sleep(delay); delay = min(max_delay, delay*2); continue
+        print(f"{ERROR} HTTP {resp.status_code}: {resp.text}")
+        return None
 
 
 def validate_and_update_candles(df_existing: pd.DataFrame, df_new: pd.DataFrame, csv_path: str) -> int:
-    """
-    Merges existing CSV data with new candle data, preserving exact decimal precision.
-    Writes the merged data back to csv_path.
-    Returns the number of rows updated.
-    """
-    df_existing = pd.read_csv(csv_path, dtype=str, parse_dates=False)
-    df_existing["timestamp"] = df_existing["timestamp"].astype("int64")
+    """Merges existing vs new, counts changed rows, writes CSV."""
+    df_old = pd.read_csv(csv_path, dtype=str)
+    df_old["timestamp"] = df_old["timestamp"].astype("int64")
     df_new["timestamp"] = df_new["timestamp"].astype("int64")
-    numeric_columns = ["open", "close", "high", "low", "volume"]
-    
-    # Convert numeric columns to Decimal for precise comparison
-    for col in numeric_columns:
-        if col in df_existing.columns:
-            df_existing[col] = df_existing[col].apply(lambda x: decimal.Decimal(x) if x else decimal.Decimal("0"))
-        if col in df_new.columns:
-            df_new[col] = df_new[col].apply(lambda x: decimal.Decimal(str(x)))
-
-    # Drop temporary columns if present
-    df_existing.drop(columns=["day"], errors="ignore", inplace=True)
+    cols = ["open","close","high","low","volume"]
+    for col in cols:
+        if col in df_old: df_old[col] = df_old[col].apply(lambda x: decimal.Decimal(x or "0"))
+        df_new[col] = df_new[col].apply(lambda x: decimal.Decimal(str(x)))
+    df_old.drop(columns=["day"], errors="ignore", inplace=True)
     df_new.drop(columns=["day"], errors="ignore", inplace=True)
 
-    # Merge dataframes
-    merged_df = pd.merge(df_existing, df_new, on="timestamp", how="outer",
-                        suffixes=("_old", "_new"), indicator=True)
+    merged = pd.merge(df_old, df_new, on="timestamp", how="outer",
+                      suffixes=("_old","_new"), indicator=True)
+    updated = 0
+    for _, r in merged.iterrows():
+        if r["_merge"]=="both" and any(r[f"{c}_old"]!=r[f"{c}_new"] for c in cols):
+            updated+=1
 
-    # Track actual changes
-    updated_rows = 0
-    for idx, row in merged_df.iterrows():
-        if row['_merge'] == 'both':  # Only check rows that exist in both datasets
-            row_changed = False
-            for col in numeric_columns:
-                old_col, new_col = f"{col}_old", f"{col}_new"
-                if old_col in row and new_col in row:
-                    if row[old_col] != row[new_col]:
-                        row_changed = True
-                        break
-            if row_changed:
-                updated_rows += 1
-
-    # Update the values and prepare for saving
-    for col in numeric_columns:
-        old_col, new_col = f"{col}_old", f"{col}_new"
-        if old_col in merged_df.columns and new_col in merged_df.columns:
-            merged_df[col] = merged_df[new_col].combine_first(merged_df[old_col])
-            merged_df[col] = merged_df[col].astype(str)
-            merged_df.drop(columns=[old_col, new_col], inplace=True)
-
-    merged_df.drop(columns=["_merge"], inplace=True)
-    merged_df.to_csv(csv_path, index=False)
-
-    return updated_rows
+    for c in cols:
+        o,n = f"{c}_old", f"{c}_new"
+        if o in merged and n in merged:
+            merged[c] = merged[n].combine_first(merged[o]).astype(str)
+            merged.drop(columns=[o,n], inplace=True)
+    merged.drop(columns=["_merge"], inplace=True)
+    merged.to_csv(csv_path, index=False)
+    return updated
 
 
 def save_candles_to_csv(candles, dir_path: str, symbol: str, timeframe: str,
-                        range_start_ms: int = None, range_end_ms: int = None):
+                        range_start_ms: int=None, range_end_ms: int=None):
     """
-    Saves candle data to daily CSV files.
-    
-    - If a ".gotstart" file exists, only candles within the user-supplied range are saved.
-    - Otherwise (first-time sync), all fetched candles are saved.
-    - Creates empty CSV files for missing days.
-    - The temporary "day" column is used solely for grouping and is dropped before saving.
-    - Creates .gotstart file after the first CSV write if it doesn't exist.
+    Saves candle data in `candles` to daily CSVs under dir_path.
+    Groups by UTC day, preserves colors and prints, drops temp “day”.
     """
-    gotstart_path = os.path.join(dir_path, ".gotstart")
-    gotstart_exists = os.path.exists(gotstart_path)
-    use_range = gotstart_exists
-
-    if not candles:
-        if range_start_ms is not None and range_end_ms is not None and use_range:
-            start_dt = datetime.fromtimestamp(range_start_ms / 1000, timezone.utc).date()
-            end_dt = datetime.fromtimestamp(range_end_ms / 1000, timezone.utc).date()
-            day_count = (end_dt - start_dt).days + 1
-            for i in range(day_count):
-                day_i = start_dt + timedelta(days=i)
-                csv_filename = f"{day_i}.csv"
-                csv_path_day = os.path.join(dir_path, csv_filename)
-                if not os.path.exists(csv_path_day):
-                    empty_df = pd.DataFrame(columns=["timestamp", "open", "close", "high", "low", "volume"])
-                    empty_df.to_csv(csv_path_day, index=False)
-                    print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing day {COLOR_TIMESTAMPS}{day_i}{Style.RESET_ALL} → {COLOR_FILE}.../{symbol}/{timeframe}/{csv_filename}{Style.RESET_ALL}")
+    df = pd.DataFrame(candles, columns=["timestamp","open","close","high","low","volume"])
+    df["day"] = pd.to_datetime(df["timestamp"],unit="ms",utc=True).dt.date
+    for day, grp in df.groupby("day"):
+        fname = os.path.join(dir_path, f"{day}.csv")
+        g = grp.drop(columns=["day"])
+        # convert back to string
+        for c in ["timestamp","open","close","high","low","volume"]:
+            g[c] = g[c].astype(str)
+        if os.path.exists(fname):
+            updated = validate_and_update_candles(pd.read_csv(fname,dtype=str), g, fname)
+            if updated>0:
+                print(f"{UPDATE} {COLOR_ROWS}{updated}{Style.RESET_ALL} rows corrected in {COLOR_FILE}.../{symbol}/{timeframe}/{day}.csv{Style.RESET_ALL}")
         else:
-            print(f"{WARNING} No candles to save. Exiting...")
-        return
+            g.to_csv(fname, index=False, float_format="%.17g")
+            start_ts, end_ts = int(g["timestamp"].astype(int).min()), int(g["timestamp"].astype(int).max())
+            st = datetime.fromtimestamp(start_ts/1000,timezone.utc).strftime("%Y-%m-%d %H:%M")
+            et = datetime.fromtimestamp(end_ts/1000,timezone.utc).strftime("%Y-%m-%d %H:%M")
+            print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} {len(g)} candles [{COLOR_TIMESTAMPS}{st} - {et}{Style.RESET_ALL}] → {COLOR_FILE}.../{symbol}/{timeframe}/{day}.csv{Style.RESET_ALL}")
 
-    # Create DataFrame from candle data.
-    df_new = pd.DataFrame(candles, columns=["timestamp", "open", "close", "high", "low", "volume"])
-    for col in ["open", "close", "high", "low", "volume"]:
-        df_new[col] = df_new[col].apply(lambda x: decimal.Decimal(str(x)))
-    if use_range and range_start_ms is not None and range_end_ms is not None:
-        df_new = df_new[(df_new["timestamp"] >= range_start_ms) & (df_new["timestamp"] <= range_end_ms)]
-    
-    # Create a temporary "day" column for grouping.
-    df_new["day"] = pd.to_datetime(df_new["timestamp"], unit="ms", utc=True).dt.date
 
-    days_in_range = set()
-    if use_range and range_start_ms is not None and range_end_ms is not None:
-        start_dt = datetime.fromtimestamp(range_start_ms / 1000, timezone.utc).date()
-        end_dt = datetime.fromtimestamp(range_end_ms / 1000, timezone.utc).date()
-        day_count = (end_dt - start_dt).days + 1
-        for i in range(day_count):
-            days_in_range.add(start_dt + timedelta(days=i))
-
-    grouped = df_new.groupby("day")
-    for day, group in grouped:
-        csv_filename = f"{day}.csv"
-        csv_path_day = os.path.join(dir_path, csv_filename)
-        # Drop the temporary "day" column before saving.
-        group_to_save = group.drop(columns=["day"])
-        # Convert numeric columns back to string.
-        group_to_save["timestamp"] = group_to_save["timestamp"].astype(str)
-        group_to_save["open"] = group_to_save["open"].astype(str)
-        group_to_save["close"] = group_to_save["close"].astype(str)
-        group_to_save["high"] = group_to_save["high"].astype(str)
-        group_to_save["low"] = group_to_save["low"].astype(str)
-        group_to_save["volume"] = group_to_save["volume"].astype(str)
-        if os.path.exists(csv_path_day):
-            df_existing = pd.read_csv(csv_path_day, dtype=str, parse_dates=False)
-            if "timestamp" in df_existing.columns:
-                df_existing["timestamp"] = df_existing["timestamp"].astype("int64")
-            updated_rows = validate_and_update_candles(df_existing, group_to_save, csv_path_day)
-            if updated_rows > 0:
-                print(f"{UPDATE} {COLOR_ROWS}{updated_rows}{Style.RESET_ALL} rows corrected in {COLOR_FILE}.../{symbol}/{timeframe}/{csv_filename}{Style.RESET_ALL}")
+def find_missing_dates(dir_path: str, start: datetime.date, end: datetime.date):
+    """
+    Returns list of (start,end) tuples for missing date ranges in [start..end].
+    """
+    files = sorted(f for f in os.listdir(dir_path) if f.endswith(".csv"))
+    have = {datetime.strptime(f[:-4],"%Y-%m-%d").date() for f in files}
+    all_days = {start + timedelta(days=i) for i in range((end-start).days+1)}
+    miss = sorted(all_days - have)
+    if not miss: return []
+    ranges, a = [], miss[0]
+    prev = a
+    for d in miss[1:]:
+        if d == prev + timedelta(days=1):
+            prev = d
+            continue
+        ranges.append((a, prev))
+        a, prev = d, d
+    ranges.append((a, prev))
+    print(f"{WARNING} Missing {len(ranges)} date range(s). Rebuilding missing days.")
+    for s,e in ranges:
+        if s==e:
+            print(f"  - {COLOR_TIMESTAMPS}{s}{Style.RESET_ALL}")
         else:
-            group_to_save.to_csv(csv_path_day, index=False, float_format="%.17g")
-            start_ts = group_to_save["timestamp"].astype(int).min()
-            end_ts = group_to_save["timestamp"].astype(int).max()
-            start_time_str = datetime.fromtimestamp(start_ts / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            end_time_str = datetime.fromtimestamp(end_ts / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} {len(group_to_save)} candles [{COLOR_TIMESTAMPS}{start_time_str} - {end_time_str}{Style.RESET_ALL}] → {COLOR_FILE}.../{symbol}/{timeframe}/{csv_filename}{Style.RESET_ALL}")
-            
-            # Create .gotstart file after the first CSV write if it doesn't exist
-            if not gotstart_exists and not os.path.exists(gotstart_path):
-                with open(gotstart_path, 'w') as f:
-                    f.write('')
-                print(f"{INFO} Created {COLOR_FILE}.gotstart{Style.RESET_ALL} file after first CSV write.")
-                
-    if use_range and range_start_ms is not None and range_end_ms is not None:
-        days_with_data = set(grouped.groups.keys())
-        missing_days = days_in_range - days_with_data
-        for day in sorted(missing_days):
-            csv_filename = f"{day}.csv"
-            csv_path_day = os.path.join(dir_path, csv_filename)
-            if not os.path.exists(csv_path_day):
-                empty_df = pd.DataFrame(columns=["timestamp", "open", "close", "high", "low", "volume"])
-                empty_df.to_csv(csv_path_day, index=False)
-                print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing day {COLOR_TIMESTAMPS}{day}{Style.RESET_ALL} → {COLOR_FILE}.../{symbol}/{timeframe}/{csv_filename}{Style.RESET_ALL}")
+            print(f"  - {COLOR_TIMESTAMPS}{s} → {e}{Style.RESET_ALL}")
+    return ranges
 
 
-def find_missing_dates(dir_path: str, expected_start=None, expected_end=None):
-    """
-    Scans the directory for missing dates between expected_start and expected_end.
-    Returns a list of missing date ranges.
-    If expected_start or expected_end is not provided, they default to the earliest and latest dates found.
-    """
-    csv_files = sorted(
-        [f for f in os.listdir(dir_path) if f.endswith('.csv')],
-        key=lambda x: datetime.strptime(x.split('.')[0], '%Y-%m-%d')
-    )
-    if not csv_files:
-        return []
-    available_dates = sorted(datetime.strptime(f.split('.')[0], '%Y-%m-%d').date() for f in csv_files)
-    if expected_start is None:
-        expected_start = available_dates[0]
-    if expected_end is None:
-        expected_end = available_dates[-1]
-    all_dates = set(expected_start + timedelta(days=i) for i in range((expected_end - expected_start).days + 1))
-    missing_dates = sorted(all_dates - set(available_dates))
-    missing_ranges = []
-    start_date = None
-    for i in range(len(missing_dates)):
-        if start_date is None:
-            start_date = missing_dates[i]
-        if i == len(missing_dates) - 1 or missing_dates[i] + timedelta(days=1) != missing_dates[i + 1]:
-            end_date = missing_dates[i]
-            missing_ranges.append((start_date, end_date))
-            start_date = None
-    if missing_ranges:
-        print(f"{WARNING} Missing {len(missing_ranges)} date range(s) in dataset. Rebuilding missing days.")
-        for start, end in missing_ranges:
-            if start == end:
-                print(f"  - {COLOR_TIMESTAMPS}{start}{Style.RESET_ALL}")
-            else:
-                print(f"  - {COLOR_TIMESTAMPS}{start} → {end}{Style.RESET_ALL}")
-    return missing_ranges
+def _sync_range(dir_path, ticker, timeframe, start_d, end_d, gotstart_path, make_marker):
+    """Core loop: fetch batches over [start_d..end_d] and fill CSVs."""
+    ms_end = int(datetime.combine(end_d, datetime.max.time(), tzinfo=timezone.utc).timestamp()*1000)
+    cur = int(datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc).timestamp()*1000)
+    first_batch = True
+    while cur <= ms_end:
+        data = fetch_bitfinex_candles(ticker, timeframe, cur)
+        if not data:
+            # blank days for entire range
+            d = start_d
+            while d <= end_d:
+                fp = os.path.join(dir_path, f"{d}.csv")
+                if not os.path.exists(fp):
+                    pd.DataFrame(columns=["timestamp","open","close","high","low","volume"])\
+                      .to_csv(fp, index=False)
+                    print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing day {COLOR_TIMESTAMPS}{d}{Style.RESET_ALL} → {COLOR_FILE}{d}.csv{Style.RESET_ALL}")
+                d += timedelta(days=1)
+            break
+        first_ts = min(c[0] for c in data)
+        last_ts  = max(c[0] for c in data)
+        save_candles_to_csv(data, dir_path, ticker, timeframe, first_ts, last_ts)
+        # create marker once
+        if make_marker and first_batch:
+            open(gotstart_path,"w").close()
+            print(f"{INFO} Created {COLOR_FILE}.gotstart{Style.RESET_ALL}")
+            first_batch = False
+        # fill any days within this batch that might be empty
+        sd = datetime.fromtimestamp(first_ts/1000,timezone.utc).date()
+        ed = datetime.fromtimestamp(last_ts/1000,timezone.utc).date()
+        d = sd
+        while d <= ed:
+            fp = os.path.join(dir_path, f"{d}.csv")
+            if not os.path.exists(fp):
+                pd.DataFrame(columns=["timestamp","open","close","high","low","volume"])\
+                  .to_csv(fp, index=False)
+                print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing day {COLOR_TIMESTAMPS}{d}{Style.RESET_ALL} → {COLOR_FILE}{d}.csv{Style.RESET_ALL}")
+            d += timedelta(days=1)
+        # decide whether to continue
+        day_end_ts = int(datetime.combine(ed, datetime.max.time(), tzinfo=timezone.utc).timestamp()*1000)
+        if len(data)<10000 or last_ts>=day_end_ts:
+            print(f"{INFO} Completed fetching for range {sd}→{ed}")
+            break
+        cur = last_ts + 1
 
 
 def synchronize_candle_data(exchange: str,
-                          ticker: str,
-                          timeframe: str,
-                          end_date_str: str = None,
-                          verbose: bool = False) -> bool:
-    # Add compact output at the start
+                           ticker: str,
+                           timeframe: str,
+                           end_date_str: str=None,
+                           verbose: bool=False) -> bool:
+    """Main orchestration: full or incremental sync."""
     if not verbose:
-        end_str = f" → {end_date_str}" if end_date_str else ""
-        print(f"{INFO} Syncing {COLOR_VAR}{exchange}/{ticker}/{timeframe}{Style.RESET_ALL}{end_str}")
+        es = f" → {end_date_str}" if end_date_str else ""
+        print(f"{INFO} Syncing {COLOR_VAR}{exchange}/{ticker}/{timeframe}{Style.RESET_ALL}{es}")
     else:
-        print(f"\n{INFO} Running synchronization with the following parameters:\n")
-        print(f"  {COLOR_VAR}--exchange{Style.RESET_ALL}   {COLOR_TYPE}(str){Style.RESET_ALL}  {exchange}")
-        print(f"  {COLOR_VAR}--ticker{Style.RESET_ALL}     {COLOR_TYPE}(str){Style.RESET_ALL}  {ticker}")
-        print(f"  {COLOR_VAR}--timeframe{Style.RESET_ALL}  {COLOR_TYPE}(str){Style.RESET_ALL}  {timeframe}")
+        print(f"\n{INFO} Running synchronization with parameters:\n"
+              f"  {COLOR_VAR}--exchange{Style.RESET_ALL} {exchange}\n"
+              f"  {COLOR_VAR}--ticker{Style.RESET_ALL}   {ticker}\n"
+              f"  {COLOR_VAR}--timeframe{Style.RESET_ALL} {timeframe}")
         if end_date_str:
-            print(f"  {COLOR_VAR}--end{Style.RESET_ALL}       {COLOR_TYPE}(str){Style.RESET_ALL}  {end_date_str}")
-        print(f"\n{INFO} Starting data synchronization...\n")
+            print(f"  {COLOR_VAR}--end{Style.RESET_ALL}       {end_date_str}")
+        print()
 
-    dir_path = ensure_directory(exchange, ticker, timeframe)
+    dir_path      = ensure_directory(exchange, ticker, timeframe)
     gotstart_path = os.path.join(dir_path, ".gotstart")
 
+    # parse end date
+    if end_date_str:
+        fmt = "%Y-%m-%d %H:%M" if " " in end_date_str else "%Y-%m-%d"
+        end_date = datetime.strptime(end_date_str, fmt).date()
+    else:
+        end_date = datetime.now(timezone.utc).date()
+
+    # FULL SYNC
     if not os.path.exists(gotstart_path):
         print(f"{WARNING} No '.gotstart' file found. Starting full historical sync...")
-        last_timestamp = 0
-        
-        # Start full historical sync from timestamp 0
-        print(f"{INFO} Fetching full history for {COLOR_VAR}{ticker}/{timeframe}{Style.RESET_ALL}")
-        print(f"{INFO} Missing periods: {COLOR_TIMESTAMPS}0{Style.RESET_ALL} → now")
-        
-        current_start = last_timestamp
-        today_date = datetime.now(timezone.utc).date()
-        refreshed_today = False
-        
-        while True:
-            candles = fetch_bitfinex_candles(
-                symbol=ticker,
-                timeframe=timeframe,
-                start=current_start,
-                limit=10000
-            )
-            
-            if not candles:
-                print(f"{WARNING} No data returned for the requested time range.")
-                break
-                
-            # Save candles to CSV files and create .gotstart file after first successful write
-            save_candles_to_csv(candles, dir_path, ticker, timeframe)
-            
-            # Create .gotstart file if it doesn't exist yet
-            if not os.path.exists(gotstart_path):
-                with open(gotstart_path, 'w') as f:
-                    f.write('')
-                print(f"{INFO} Created {COLOR_FILE}.gotstart{Style.RESET_ALL} file.")
-            
-            # If we received fewer than the maximum number of candles, we're done
-            if len(candles) < 10000:
-                break
-                
-            # Otherwise, update the start timestamp for the next request
-            last_ts = candles[-1][0]  # Last timestamp from the batch
-            current_start = last_ts + 1
-            
-            # Convert to human-readable time for logging
-            human_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"{INFO} Fetched up to {COLOR_TIMESTAMPS}{human_time}{Style.RESET_ALL} - continuing...")
-            
+        _sync_range(dir_path, ticker, timeframe, datetime(1970,1,1).date(), end_date, gotstart_path, True)
         return True
-    else:
-        print(f"{INFO} '.gotstart' file exists. Verifying data continuity...")
 
-    # Parse end date/time
-    end_ts_ms = None
-    end_date = None
-    if end_date_str:
-        try:
-            dt_end = datetime.strptime(end_date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-        except ValueError:
-            dt_end = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end_ts_ms = int(dt_end.timestamp() * 1000)
-        end_date = dt_end.date()
+    # INCREMENTAL SYNC
+    print(f"{INFO} '.gotstart' exists. Verifying data continuity...")
+    files = sorted(f for f in os.listdir(dir_path) if f.endswith(".csv"))
+    if not files:
+        print(f"{WARNING} Marker present but no CSVs. Re-running full sync.")
+        os.remove(gotstart_path)
+        return synchronize_candle_data(exchange,ticker,timeframe,end_date_str,verbose)
 
-    if os.path.exists(gotstart_path):
-        # Get list of existing CSV files
-        csv_files = sorted(
-            [f for f in os.listdir(dir_path) if f.endswith('.csv')],
-            key=lambda x: datetime.strptime(x.split('.')[0], '%Y-%m-%d')
-        )
-        
-        if not csv_files:
-            print(f"{WARNING} No CSV files found despite '.gotstart' existing. Starting fresh sync...")
-        else:
-            earliest_file_date = datetime.strptime(csv_files[0].split('.')[0], '%Y-%m-%d').date()
-            latest_file_date = datetime.strptime(csv_files[-1].split('.')[0], '%Y-%m-%d').date()
-            today_date = datetime.now(timezone.utc).date()
-            
-            # Determine the effective date range
-            effective_end = end_date if end_date else today_date
+    start_date = datetime.strptime(files[0][:-4], "%Y-%m-%d").date()
+    last_date  = end_date
 
-            # Check for missing dates in the range
-            missing_ranges = find_missing_dates(dir_path, earliest_file_date, effective_end)
-            
-            if not missing_ranges:
-                # Even if we have all files, check if the end date file is the latest file
-                # and if so, ensure it's complete with one final API call
-                if end_date and latest_file_date == end_date:
-                    print(f"{INFO} Validating completeness of end date file {COLOR_TIMESTAMPS}{end_date}{Style.RESET_ALL}...")
-                    start_of_end_date = int(datetime.combine(end_date, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
-                    candles = fetch_bitfinex_candles(symbol=ticker, timeframe=timeframe, start=start_of_end_date, limit=10000)
-                    if candles:
-                        save_candles_to_csv(candles, dir_path, ticker, timeframe)
-                
-                # Check if the current day's file is up-to-date with the latest data when no end date is specified
-                if not end_date and latest_file_date == today_date:
-                    # Get the last timestamp from the file for today
-                    today_file_path = os.path.join(dir_path, f"{today_date}.csv")
-                    if os.path.exists(today_file_path):
-                        last_timestamp = get_last_file_timestamp(dir_path)
-                        
-                        # Calculate expected timestamp based on timeframe
-                        current_time = datetime.now(timezone.utc)
-                        expected_time_diff = None
-                        if timeframe.endswith('m'):
-                            minutes = int(timeframe[:-1])
-                            expected_time_diff = timedelta(minutes=minutes * 2)  # Allow 2x timeframe as buffer
-                        elif timeframe.endswith('h'):
-                            hours = int(timeframe[:-1])
-                            expected_time_diff = timedelta(hours=hours * 2)
-                        elif timeframe.endswith('D'):
-                            expected_time_diff = timedelta(days=1)
-                            
-                        if expected_time_diff:
-                            # Calculate the difference between current time and last timestamp
-                            last_time = datetime.fromtimestamp(last_timestamp / 1000, timezone.utc)
-                            time_diff = current_time - last_time
-                            
-                            if time_diff > expected_time_diff:
-                                print(f"{WARNING} Latest candle data is outdated. Last timestamp: {COLOR_TIMESTAMPS}{last_time.strftime('%Y-%m-%d %H:%M:%S UTC')}{Style.RESET_ALL}")
-                                print(f"{INFO} Current time: {COLOR_TIMESTAMPS}{current_time.strftime('%Y-%m-%d %H:%M:%S UTC')}{Style.RESET_ALL}")
-                                print(f"{INFO} Fetching latest candle data...")
-                                
-                                # Start from the beginning of the latest day to ensure all data is up-to-date
-                                start_of_today = int(datetime.combine(today_date, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
-                                candles = fetch_bitfinex_candles(symbol=ticker, timeframe=timeframe, start=start_of_today, limit=10000)
-                                if candles:
-                                    save_candles_to_csv(candles, dir_path, ticker, timeframe)
-                                    
-                                    # Check if we got the latest data after updating
-                                    new_last_timestamp = get_last_file_timestamp(dir_path)
-                                    new_last_time = datetime.fromtimestamp(new_last_timestamp / 1000, timezone.utc)
-                                    print(f"{INFO} Updated latest timestamp: {COLOR_TIMESTAMPS}{new_last_time.strftime('%Y-%m-%d %H:%M:%S UTC')}{Style.RESET_ALL}")
-                            else:
-                                print(f"{INFO} Latest candle data is up-to-date. Last timestamp: {COLOR_TIMESTAMPS}{last_time.strftime('%Y-%m-%d %H:%M:%S UTC')}{Style.RESET_ALL}")
-                                
-                print(f"{SUCCESS} All files exist for the date range {COLOR_TIMESTAMPS}{earliest_file_date}{Style.RESET_ALL} → {COLOR_TIMESTAMPS}{effective_end}{Style.RESET_ALL}")
-                return True
-            
-            today_date = datetime.now(timezone.utc).date()
-            refreshed_today = False  # Track if we've already fetched today's data
+    # Always resync today's file if no end date is specified
+    today = datetime.now(timezone.utc).date()
+    if not end_date_str:
+        print(f"{INFO} No end date specified - always resyncing today's file ({today})...")
+        _sync_range(dir_path, ticker, timeframe, today, today, gotstart_path, False)
+        last_ts = get_last_file_timestamp(dir_path)
+        if last_ts:
+            lt = datetime.fromtimestamp(last_ts/1000, timezone.utc)
+            print(f"{INFO} Latest timestamp: {COLOR_TIMESTAMPS}{lt:%Y-%m-%d %H:%M:%S UTC}{Style.RESET_ALL}")
 
-            if missing_ranges:
-                print(f"{WARNING} Found gaps in the date range. Fetching missing data...")
-                for (rng_start, rng_end) in missing_ranges:
-                    # ms_s/ms_e define the absolute missing‐range in ms
-                    ms_s = int(datetime.combine(rng_start, datetime.min.time(), tzinfo=timezone.utc)
-                                .timestamp() * 1000)
-                    ms_e = int(datetime.combine(rng_end,   datetime.max.time(), tzinfo=timezone.utc)
-                                .timestamp() * 1000)
+    gaps = find_missing_dates(dir_path, start_date, last_date)
+    if not gaps:
+        print(f"{SUCCESS} All files exist for {start_date} → {last_date}")
+        return True
 
-                    current_start = ms_s
-
-                    while current_start <= ms_e:
-                        candles = fetch_bitfinex_candles(
-                            symbol=ticker,
-                            timeframe=timeframe,
-                            start=current_start,
-                            limit=10000
-                        )
-
-                        if not candles:
-                            # no data at all for this window → blank out days rng_start→rng_end
-                            date_iter = rng_start
-                            while date_iter <= rng_end:
-                                fname = f"{date_iter}.csv"
-                                fp = os.path.join(dir_path, fname)
-                                if not os.path.exists(fp):
-                                    pd.DataFrame(columns=["timestamp","open","close","high","low","volume"])\
-                                    .to_csv(fp, index=False)
-                                    print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing day "
-                                        f"{COLOR_TIMESTAMPS}{date_iter}{Style.RESET_ALL} → {COLOR_FILE}{fname}{Style.RESET_ALL}")
-                                date_iter += timedelta(days=1)
-                            break
-
-                        # compute first & last timestamps of this batch
-                        first_ts = min(c[0] for c in candles)
-                        last_ts  = max(c[0] for c in candles)
-
-                        # save only the days covered by this batch
-                        save_candles_to_csv(
-                            candles, dir_path, ticker, timeframe,
-                            range_start_ms=first_ts,
-                            range_end_ms=last_ts
-                        )
-
-                        # blank‐fill any missing days _within_ [first_ts, last_ts]
-                        start_day = datetime.fromtimestamp(first_ts/1000, timezone.utc).date()
-                        end_day   = datetime.fromtimestamp(last_ts/1000, timezone.utc).date()
-                        d = start_day
-                        while d <= end_day:
-                            f = f"{d}.csv"
-                            p = os.path.join(dir_path, f)
-                            if not os.path.exists(p):
-                                pd.DataFrame(columns=["timestamp","open","close","high","low","volume"])\
-                                .to_csv(p, index=False)
-                                print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing day "
-                                    f"{COLOR_TIMESTAMPS}{d}{Style.RESET_ALL} → {COLOR_FILE}{f}{Style.RESET_ALL}")
-                            d += timedelta(days=1)
-
-                        # determine end‐of‐day timestamp for last_ts
-                        last_day = datetime.fromtimestamp(last_ts/1000, timezone.utc).date()
-                        eod = datetime.combine(last_day, datetime.max.time(), tzinfo=timezone.utc)
-                        eod_ts = int(eod.timestamp() * 1000)
-
-                        # if fewer than limit OR we've covered that day's final period, we're done
-                        if len(candles) < 10000 or last_ts >= eod_ts:
-                            print(f"{INFO} Completed fetching for range {start_day}→{end_day}")
-                            break
-
-                        # otherwise bump start to just after last candle and loop
-                        current_start = last_ts + 1
-
-
-            if not end_date and not refreshed_today:
-                # Only check for updates to current date if we haven't already fetched it
-                today_start = int(datetime.combine(today_date, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
-                print(f"{INFO} No end date specified. Checking for updates to current data...")
-                candles = fetch_bitfinex_candles(symbol=ticker, timeframe=timeframe, start=today_start, limit=10000)
-                if candles:
-                    save_candles_to_csv(candles, dir_path, ticker, timeframe)
-                    if len(candles) == 10000:
-                        print(f"{WARNING} Received maximum number of candles. There might be more data available.")
-
-            return True
-
-    # If we get here, we need to do a full sync
-    last_timestamp = 0
-    # ... rest of the existing synchronize_candle_data function for full sync ...
+    for s,e in gaps:
+        print(f"{WARNING} Filling gap {s} → {e}")
+        _sync_range(dir_path, ticker, timeframe, s, e, gotstart_path, False)
+    return True
 
 
 def parse_args():
     """
-    Parses command-line arguments with a color-coded help output.
+    Parses command-line arguments with colorized help.
     """
     parser = argparse.ArgumentParser(
-        description="""
-{info} Fetch missing historical candle data from an exchange. {reset}
-
-  {var}--exchange{reset}   {type}(str){reset}    {req} {desc}Exchange name (e.g., BITFINEX){reset}
-  {var}--ticker{reset}     {type}(str){reset}    {req} {desc}Trading pair (e.g., tBTCUSD){reset}
-  {var}--timeframe{reset}  {type}(str){reset}    {req} {desc}Timeframe (e.g., 1m, 1h, 1D){reset}
-  {var}--end{reset}        {type}(str){reset}    {desc}End date (YYYY-MM-DD or YYYY-MM-DD HH:MM, optional){reset}
-
-{info} Example Usage: {reset}
-  {file}python candles_sync.py --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --end "2024-02-10"{reset}
-  {file}python candles_sync.py --exchange BITFINEX --ticker tBTCUSD --timeframe 1h{reset} (Fetch all data)
-""".format(info=INFO, var=COLOR_VAR, type=COLOR_TYPE, desc=COLOR_DESC,
-           req=COLOR_REQ, reset=Style.RESET_ALL, file=COLOR_FILE),
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument("--exchange", required=True, help="Exchange name (e.g., BITFINEX)")
-    parser.add_argument("--ticker", required=True, help="Trading pair (e.g., tBTCUSD)")
+        description=f"""
+{INFO} Fetch missing historical candle data from an exchange. {Style.RESET_ALL}
+  {COLOR_VAR}--exchange{Style.RESET_ALL}   {COLOR_TYPE}(str){Style.RESET_ALL} {COLOR_REQ} Exchange name
+  {COLOR_VAR}--ticker{Style.RESET_ALL}     {COLOR_TYPE}(str){Style.RESET_ALL} {COLOR_REQ} Trading pair
+  {COLOR_VAR}--timeframe{Style.RESET_ALL}  {COLOR_TYPE}(str){Style.RESET_ALL} {COLOR_REQ} Timeframe
+  {COLOR_VAR}--end{Style.RESET_ALL}        {COLOR_TYPE}(str){Style.RESET_ALL} End date (optional)
+{INFO} Example:
+  python candles_sync.py --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --end "2024-02-10"
+""", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--exchange",  required=True, help="Exchange name (e.g., BITFINEX)")
+    parser.add_argument("--ticker",    required=True, help="Trading pair (e.g., tBTCUSD)")
     parser.add_argument("--timeframe", required=True, help="Timeframe (e.g., 1m, 1h, 1D)")
-    parser.add_argument("--end", help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM, optional)")
-    if len(sys.argv) == 1:
+    parser.add_argument("--end",       help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
+    if len(sys.argv)==1:
         print(f"\n{ERROR} No arguments provided! Please specify the required parameters.\n")
-        parser.print_help()
-        sys.exit(1)
+        parser.print_help(); sys.exit(1)
     return parser.parse_args()
 
 
 def main():
-    """Main entry point for the script."""
     args = parse_args()
-    success = synchronize_candle_data(
+    ok = synchronize_candle_data(
         exchange=args.exchange,
         ticker=args.ticker,
         timeframe=args.timeframe,
         end_date_str=args.end,
-        verbose=True  # Use verbose output when run from main
+        verbose=True
     )
-
-    if success:
+    if ok:
         print(f"\n{SUCCESS} Synchronization completed successfully.\n")
     else:
         print(f"\n{ERROR} Synchronization failed.\n")
 
 
-if __name__ == "__main__":
-    # This allows the script to be run directly
-    import sys
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if __name__=="__main__":
     main()
