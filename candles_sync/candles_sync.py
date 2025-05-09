@@ -434,52 +434,13 @@ def synchronize_candle_data(exchange: str,
     return True
 
 
-def parse_args():
-    """
-    Parses command-line arguments with colorized help.
-    The --timeframe argument is removed, as we always fetch 1m, 1h, and 1D.
-    """
-    parser = argparse.ArgumentParser(
-        description=f"""
-{INFO} Fetch missing historical candle data from an exchange. {Style.RESET_ALL}
-  {COLOR_VAR}--exchange{Style.RESET_ALL}   {COLOR_TYPE}(str){Style.RESET_ALL} {COLOR_REQ} Exchange name
-  {COLOR_VAR}--ticker{Style.RESET_ALL}     {COLOR_TYPE}(str){Style.RESET_ALL} {COLOR_REQ} Trading pair
-  {COLOR_VAR}--end{Style.RESET_ALL}        {COLOR_TYPE}(str){Style.RESET_ALL} End date (optional)
-
-The script automatically fetches/syncs 3 timeframes: 1m, 1h, and 1D.
-
-{INFO} Example:
-  python candles_sync.py --exchange BITFINEX --ticker tBTCUSD --end "2024-02-10"
-""", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--exchange",  required=True, help="Exchange name (e.g., BITFINEX)")
-    parser.add_argument("--ticker",    required=True, help="Trading pair (e.g., tBTCUSD)")
-    parser.add_argument("--end",       help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
-    if len(sys.argv) == 1:
-        print(f"\n{ERROR} No arguments provided! Please specify the required parameters.\n")
-        parser.print_help()
-        sys.exit(1)
-    return parser.parse_args()
+# Note: parse_args has been moved to example.py
 
 
-def main():
-    args = parse_args()
-
-    # We always run these three timeframes in sequence:
-    timeframes = ["1m", "1h", "1D"]
-    for tf in timeframes:
-        ok = synchronize_candle_data(
-            exchange=args.exchange,
-            ticker=args.ticker,
-            timeframe=tf,
-            end_date_str=args.end,
-            verbose=True
-        )
-        if not ok:
-            print(f"\n{ERROR} Synchronization failed for {tf}.\n")
-            sys.exit(1)
-
-    print(f"\n{SUCCESS} Synchronization completed successfully for all timeframes (1m, 1h, 1D).\n")
+# Note: main function has been moved to example.py
 
 
 if __name__=="__main__":
-    main()
+    # Main functionality has been moved to example.py
+    print("Please run example.py instead.")
+    print("Example: python example.py --exchange BITFINEX --ticker tBTCUSD")

@@ -1,4 +1,4 @@
-from .candles_sync import main, synchronize_candle_data
+from .candles_sync import synchronize_candle_data
 
 __version__ = "0.1.0"
 
