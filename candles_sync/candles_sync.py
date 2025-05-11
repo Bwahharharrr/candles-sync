@@ -10,7 +10,9 @@ for 3 timeframes automatically:
 
 Features:
 - First‐time sync (no ".gotstart" file): queries from the epoch (0) to build full history.
-- Incremental sync (".gotstart" exists): finds missing partitions and backfills.
+- Incremental sync (".gotstart" exists): finds missing partitions and backfills, 
+  then continues exactly from the last stored candle, re-fetching the last candle 
+  so that incomplete data can be updated.
 - Robust backoff on network errors and rate limits.
 - Preserves all logging output, ANSI colors, function names, and CLI usage.
 
@@ -63,6 +65,7 @@ COLOR_REQ        = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
 # Bitfinex API URL template
 BITFINEX_API_URL = "https://api-pub.bitfinex.com/v2/candles/trade:{}:{}/hist"
 ROOT_PATH        = os.path.expanduser("~/.corky")
+
 
 def ensure_directory(exchange: str, ticker: str, timeframe: str) -> str:
     """Ensures that the data directory for a given timeframe exists."""
@@ -289,7 +292,8 @@ def _sync_range(dir_path, ticker, timeframe,
     for the given timeframe partition style.
     """
     ms_end = int(end_dt.replace(hour=23, minute=59, second=59).timestamp() * 1000)
-    cur = int(start_dt.replace(hour=0, minute=0, second=0).timestamp() * 1000)
+    # We now precisely honor the datetime, so we can re-fetch existing last candle if needed.
+    cur = int(start_dt.timestamp() * 1000)
     first_batch = True
 
     while cur <= ms_end:
@@ -354,7 +358,7 @@ def synchronize_candle_data(exchange: str,
         print(f"\n{INFO} Running synchronization with parameters:\n"
               f"  {COLOR_VAR}--exchange{Style.RESET_ALL} {exchange}\n"
               f"  {COLOR_VAR}--ticker{Style.RESET_ALL}   {ticker}\n"
-              f"  [Timeframe internally set to '{timeframe}']" )
+              f"  [Timeframe internally set to '{timeframe}']")
         if end_date_str:
             print(f"  {COLOR_VAR}--end{Style.RESET_ALL}       {end_date_str}")
         print()
@@ -397,22 +401,8 @@ def synchronize_candle_data(exchange: str,
     except:
         earliest_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-    now_utc_date = datetime.now(timezone.utc)
-    if not end_date_str:
-        print(f"{INFO} No end date specified - always resyncing current partition for {timeframe}...")
-        _sync_range(dir_path, ticker, timeframe, now_utc_date, now_utc_date, gotstart_path, False)
-        last_ts = get_last_file_timestamp(dir_path)
-        if last_ts:
-            lt = datetime.fromtimestamp(last_ts/1000, timezone.utc)
-            print(f"{INFO} Latest timestamp for {timeframe}: "
-                  f"{COLOR_TIMESTAMPS}{lt:%Y-%m-%d %H:%M:%S UTC}{Style.RESET_ALL}")
-
+    # First, fill any older missing partitions:
     missing = find_missing_partitions(dir_path, timeframe, earliest_dt, end_date)
-    if not missing:
-        print(f"{SUCCESS} All files exist for {timeframe} from {earliest_dt.date()} → {end_date.date()}")
-        return True
-
-    # fill the gaps
     for mp in missing:
         print(f"{WARNING} Filling gap: {mp} for {timeframe}")
         if timeframe == "1m":
@@ -431,13 +421,33 @@ def synchronize_candle_data(exchange: str,
             e_dt = end_date
 
         _sync_range(dir_path, ticker, timeframe, s_dt, e_dt, gotstart_path, False)
+
+    # Next, truly incremental from the last-known candle forward,
+    # but ensuring we refresh that last candle:
+    last_ts = get_last_file_timestamp(dir_path)
+    if last_ts is not None:
+        # Subtract 1 millisecond to ensure we re-fetch that last candle
+        # (in case it was incomplete earlier).
+        # Also ensure we don't go below epoch:
+        refetch_dt = datetime.fromtimestamp(max(0, last_ts - 1) / 1000, timezone.utc)
+        if refetch_dt < datetime(1970, 1, 1, tzinfo=timezone.utc):
+            refetch_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        start_dt = refetch_dt
+
+        if start_dt <= end_date:
+            print(f"{INFO} Incremental sync from {start_dt} to {end_date} for {timeframe} ...")
+            _sync_range(dir_path, ticker, timeframe, start_dt, end_date, gotstart_path, False)
+        else:
+            print(f"{INFO} Data already up to or beyond {end_date}. No incremental fetch needed.")
+
+    # Final report
+    last_ts_final = get_last_file_timestamp(dir_path)
+    if last_ts_final:
+        lt = datetime.fromtimestamp(last_ts_final/1000, timezone.utc)
+        print(f"{INFO} Final latest timestamp for {timeframe}: "
+              f"{COLOR_TIMESTAMPS}{lt:%Y-%m-%d %H:%M:%S UTC}{Style.RESET_ALL}")
+
     return True
-
-
-# Note: parse_args has been moved to example.py
-
-
-# Note: main function has been moved to example.py
 
 
 if __name__=="__main__":
