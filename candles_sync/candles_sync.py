@@ -10,15 +10,16 @@ for 3 timeframes automatically:
 
 Features:
 - First‐time sync (no ".gotstart" file): queries from the epoch (0) to build full history.
-- Incremental sync (".gotstart" exists): finds missing partitions and backfills, 
-  then continues exactly from the last stored candle, re-fetching the last candle 
-  so that incomplete data can be updated.
-- Robust backoff on network errors and rate limits.
-- Preserves all logging output, ANSI colors, function names, and CLI usage.
+- Incremental sync (".gotstart" exists): always re‐fetch from the start of the last known partition
+  (treated as incomplete), plus fills any missing partitions.
+- Single fetch chunk per timeframe (unless the data is large enough to exceed 10k, in which case
+  the script continues in chunks but does not repeat the same dates).
+- Preserves logging output, ANSI colors, function names, and CLI usage.
 
 Usage:
     python candles_sync.py --exchange BITFINEX --ticker tBTCUSD [--end YYYY-MM-DD]
-    (It will fetch/sync 1m, 1h, and 1D partitions automatically.)
+    or
+    python candles_sync.py --exchange BITFINEX --ticker tBTCUSD --timeframe 1m
 """
 
 import argparse
@@ -40,7 +41,7 @@ try:
     colorama.init(autoreset=True)
 except ImportError:
     class NoColor:
-        def __getattr__(self, item): 
+        def __getattr__(self, item):
             return ''
     Fore = Style = NoColor()
 
@@ -66,7 +67,6 @@ COLOR_REQ        = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
 BITFINEX_API_URL = "https://api-pub.bitfinex.com/v2/candles/trade:{}:{}/hist"
 ROOT_PATH        = os.path.expanduser("~/.corky")
 
-
 def ensure_directory(exchange: str, ticker: str, timeframe: str) -> str:
     """Ensures that the data directory for a given timeframe exists."""
     dir_path = os.path.join(ROOT_PATH, exchange, "candles", ticker, timeframe)
@@ -76,7 +76,6 @@ def ensure_directory(exchange: str, ticker: str, timeframe: str) -> str:
     else:
         print(f"{INFO} Directory already exists: {COLOR_DIR}{dir_path}{Style.RESET_ALL}")
     return dir_path
-
 
 def get_last_file_timestamp(dir_path: str):
     """
@@ -98,10 +97,10 @@ def get_last_file_timestamp(dir_path: str):
           f"{COLOR_TIMESTAMPS}{ts}{Style.RESET_ALL} ({human})")
     return ts
 
-
 def fetch_bitfinex_candles(symbol: str, timeframe: str, start: int, limit: int = 10000):
     """
     Fetches up to `limit` candles starting at `start`, with exponential backoff.
+    If the returned data length is less than limit, it indicates no more data beyond.
     """
     url = BITFINEX_API_URL.format(timeframe, symbol)
     params = {"limit": limit, "sort": 1, "start": start}
@@ -142,25 +141,26 @@ def fetch_bitfinex_candles(symbol: str, timeframe: str, start: int, limit: int =
         print(f"{ERROR} HTTP {resp.status_code}: {resp.text}")
         return None
 
-
 def validate_and_update_candles(df_existing: pd.DataFrame, df_new: pd.DataFrame, csv_path: str) -> int:
     """Merges existing vs new, counts changed rows, writes CSV."""
     df_old = pd.read_csv(csv_path, dtype=str)
     df_old["timestamp"] = df_old["timestamp"].astype("int64")
     df_new["timestamp"] = df_new["timestamp"].astype("int64")
-    cols = ["open","close","high","low","volume"]
+    cols = ["open", "close", "high", "low", "volume"]
     for col in cols:
         if col in df_old:
             df_old[col] = df_old[col].apply(lambda x: decimal.Decimal(x or "0"))
         df_new[col] = df_new[col].apply(lambda x: decimal.Decimal(str(x)))
 
     # Remove any leftover partition columns
-    for leftover in ["day","partition"]:
+    for leftover in ["day", "partition"]:
         df_old.drop(columns=[leftover], errors="ignore", inplace=True)
         df_new.drop(columns=[leftover], errors="ignore", inplace=True)
 
-    merged = pd.merge(df_old, df_new, on="timestamp", how="outer",
-                      suffixes=("_old","_new"), indicator=True)
+    merged = pd.merge(
+        df_old, df_new, on="timestamp", how="outer",
+        suffixes=("_old", "_new"), indicator=True
+    )
     updated = 0
     for _, r in merged.iterrows():
         if r["_merge"] == "both" and any(r[f"{c}_old"] != r[f"{c}_new"] for c in cols):
@@ -175,7 +175,6 @@ def validate_and_update_candles(df_existing: pd.DataFrame, df_new: pd.DataFrame,
     merged.drop(columns=["_merge"], inplace=True)
     merged.to_csv(csv_path, index=False)
     return updated
-
 
 def partition_from_timestamp(timeframe: str, ts: int) -> str:
     """
@@ -192,7 +191,6 @@ def partition_from_timestamp(timeframe: str, ts: int) -> str:
     else:
         # covers '1D'
         return dt.strftime("%Y")
-
 
 def generate_partitions(timeframe: str, start_date: datetime, end_date: datetime):
     """
@@ -227,9 +225,8 @@ def generate_partitions(timeframe: str, start_date: datetime, end_date: datetime
             cur = cur.replace(year=cur.year + 1, month=1, day=1)
         return partitions
 
-
 def save_candles_to_csv(candles, dir_path: str, symbol: str, timeframe: str,
-                        range_start_ms: int=None, range_end_ms: int=None):
+                        range_start_ms: int = None, range_end_ms: int = None):
     """
     Saves candle data in `candles` to partitioned CSVs under dir_path.
 
@@ -238,17 +235,17 @@ def save_candles_to_csv(candles, dir_path: str, symbol: str, timeframe: str,
       1h => group by YYYY-MM
       1D => group by YYYY
     """
-    df = pd.DataFrame(candles, columns=["timestamp","open","close","high","low","volume"])
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "close", "high", "low", "volume"])
     df["partition"] = df["timestamp"].apply(lambda x: partition_from_timestamp(timeframe, x))
 
     for part_val, grp in df.groupby("partition"):
         fname = os.path.join(dir_path, f"{part_val}.csv")
         g = grp.drop(columns=["partition"])
-        for c in ["timestamp","open","close","high","low","volume"]:
+        for c in ["timestamp", "open", "close", "high", "low", "volume"]:
             g[c] = g[c].astype(str)
 
         if os.path.exists(fname):
-            updated = validate_and_update_candles(pd.read_csv(fname,dtype=str), g, fname)
+            updated = validate_and_update_candles(pd.read_csv(fname, dtype=str), g, fname)
             if updated > 0:
                 print(f"{UPDATE} {COLOR_ROWS}{updated}{Style.RESET_ALL} rows corrected in "
                       f"{COLOR_FILE}.../{symbol}/{timeframe}/{part_val}.csv{Style.RESET_ALL}")
@@ -256,17 +253,82 @@ def save_candles_to_csv(candles, dir_path: str, symbol: str, timeframe: str,
             g.to_csv(fname, index=False, float_format="%.17g")
             start_ts = int(g["timestamp"].astype(int).min())
             end_ts = int(g["timestamp"].astype(int).max())
-            st = datetime.fromtimestamp(start_ts/1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            et = datetime.fromtimestamp(end_ts/1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            st = datetime.fromtimestamp(start_ts / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            et = datetime.fromtimestamp(end_ts / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
             print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} {len(g)} candles "
                   f"[{COLOR_TIMESTAMPS}{st} - {et}{Style.RESET_ALL}] → "
                   f"{COLOR_FILE}.../{symbol}/{timeframe}/{part_val}.csv{Style.RESET_ALL}")
 
+def _sync_range(dir_path, ticker, timeframe,
+                start_dt: datetime, end_dt: datetime,
+                gotstart_path, make_marker):
+    """
+    Core loop: fetch batches from `start_dt` forward. If end_dt is None,
+    we fetch until the API returns fewer than `limit` candles (which means
+    there's no more data). If end_dt is a valid date, we stop when we pass it
+    or when the API returns fewer than `limit` candles.
+    """
+    if end_dt is not None:
+        ms_end = int(end_dt.replace(hour=23, minute=59, second=59).timestamp() * 1000)
+    else:
+        ms_end = None
+
+    cur = int(start_dt.timestamp() * 1000)
+    first_batch = True
+
+    while True:
+        if ms_end is not None and cur > ms_end:
+            break
+
+        data = fetch_bitfinex_candles(ticker, timeframe, cur)
+        if not data:
+            # If no data found, stop fetching further
+            if ms_end is not None:
+                # Create empty CSV for all missing partitions in that range
+                missing_partitions = generate_partitions(timeframe, start_dt, end_dt)
+                for mp in missing_partitions:
+                    fp = os.path.join(dir_path, f"{mp}.csv")
+                    if not os.path.exists(fp):
+                        pd.DataFrame(columns=["timestamp","open","close","high","low","volume"]) \
+                          .to_csv(fp, index=False)
+                        print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing partition "
+                              f"{COLOR_TIMESTAMPS}{mp}{Style.RESET_ALL} → {COLOR_FILE}{mp}.csv{Style.RESET_ALL}")
+            break
+
+        first_ts = min(c[0] for c in data)
+        last_ts  = max(c[0] for c in data)
+
+        save_candles_to_csv(data, dir_path, ticker, timeframe, first_ts, last_ts)
+
+        if make_marker and first_batch:
+            # create ".gotstart" marker only once
+            open(gotstart_path, "w").close()
+            print(f"{INFO} Created {COLOR_FILE}.gotstart{Style.RESET_ALL}")
+            first_batch = False
+
+        if len(data) < 10000:
+            print(f"{INFO} Completed fetching for timeframe chunk up to {datetime.fromtimestamp(last_ts/1000, timezone.utc).date()}")
+            break
+
+        # Move 'cur' just beyond the last fetched timestamp
+        cur = last_ts + 1
+
+        if ms_end is not None and cur > ms_end:
+            break
+
+def parse_partition_date(tf: str, part_str: str) -> datetime:
+    """Given a timeframe and partition string, return a datetime at the partition start."""
+    if tf == "1m":
+        return datetime.strptime(part_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    elif tf == "1h":
+        return datetime.strptime(part_str, "%Y-%m").replace(day=1, tzinfo=timezone.utc)
+    else:  # '1D'
+        return datetime.strptime(part_str, "%Y").replace(month=1, day=1, tzinfo=timezone.utc)
 
 def find_missing_partitions(dir_path: str, timeframe: str,
                             start_date: datetime, end_date: datetime):
     """
-    Returns a list of missing partition strings in [start_date..end_date]
+    Returns a sorted list of missing partition strings in [start_date..end_date]
     for the given timeframe.
     """
     files = sorted(f for f in os.listdir(dir_path) if f.endswith(".csv"))
@@ -275,72 +337,11 @@ def find_missing_partitions(dir_path: str, timeframe: str,
     all_needed = generate_partitions(timeframe, start_date, end_date)
     all_needed_set = set(all_needed)
     missing = sorted(all_needed_set - have)
-    if not missing:
-        return []
-
-    print(f"{WARNING} Missing {len(missing)} partition(s). Rebuilding missing partitions:")
-    for m in missing:
-        print(f"  - {COLOR_TIMESTAMPS}{m}{Style.RESET_ALL}")
+    if missing:
+        print(f"{WARNING} Missing {len(missing)} partition(s). Rebuilding missing partitions:")
+        for m in missing:
+            print(f"  - {COLOR_TIMESTAMPS}{m}{Style.RESET_ALL}")
     return missing
-
-
-def _sync_range(dir_path, ticker, timeframe,
-                start_dt: datetime, end_dt: datetime,
-                gotstart_path, make_marker):
-    """
-    Core loop: fetch batches over [start_dt..end_dt] and fill CSVs
-    for the given timeframe partition style.
-    """
-    ms_end = int(end_dt.replace(hour=23, minute=59, second=59).timestamp() * 1000)
-    # We now precisely honor the datetime, so we can re-fetch existing last candle if needed.
-    cur = int(start_dt.timestamp() * 1000)
-    first_batch = True
-
-    while cur <= ms_end:
-        data = fetch_bitfinex_candles(ticker, timeframe, cur)
-        if not data:
-            # Create empty CSV for each missing partition in range
-            missing_partitions = generate_partitions(timeframe, start_dt, end_dt)
-            for mp in missing_partitions:
-                fp = os.path.join(dir_path, f"{mp}.csv")
-                if not os.path.exists(fp):
-                    pd.DataFrame(columns=["timestamp","open","close","high","low","volume"]) \
-                      .to_csv(fp, index=False)
-                    print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing partition "
-                          f"{COLOR_TIMESTAMPS}{mp}{Style.RESET_ALL} → {COLOR_FILE}{mp}.csv{Style.RESET_ALL}")
-            break
-
-        first_ts = min(c[0] for c in data)
-        last_ts  = max(c[0] for c in data)
-
-        save_candles_to_csv(data, dir_path, ticker, timeframe, first_ts, last_ts)
-
-        # create marker once
-        if make_marker and first_batch:
-            open(gotstart_path,"w").close()
-            print(f"{INFO} Created {COLOR_FILE}.gotstart{Style.RESET_ALL}")
-            first_batch = False
-
-        # Fill any empty partition files within this batch
-        earliest_dt = datetime.fromtimestamp(first_ts/1000, timezone.utc)
-        latest_dt   = datetime.fromtimestamp(last_ts/1000, timezone.utc)
-        missing_partitions = generate_partitions(timeframe, earliest_dt, latest_dt)
-        for mp in missing_partitions:
-            fp = os.path.join(dir_path, f"{mp}.csv")
-            if not os.path.exists(fp):
-                pd.DataFrame(columns=["timestamp","open","close","high","low","volume"]) \
-                  .to_csv(fp, index=False)
-                print(f"{COLOR_NEW}[NEW]{Style.RESET_ALL} Created empty CSV for missing partition "
-                      f"{COLOR_TIMESTAMPS}{mp}{Style.RESET_ALL} → {COLOR_FILE}{mp}.csv{Style.RESET_ALL}")
-
-        # decide whether to continue
-        if len(data) < 10000:
-            print(f"{INFO} Completed fetching for timeframe chunk up to {latest_dt.date()}")
-            break
-
-        # if we got 10k candles, step beyond last_ts and continue
-        cur = last_ts + 1
-
 
 def synchronize_candle_data(exchange: str,
                             ticker: str,
@@ -348,8 +349,8 @@ def synchronize_candle_data(exchange: str,
                             end_date_str: str=None,
                             verbose: bool=False) -> bool:
     """
-    Main orchestration: full or incremental sync for a single timeframe
-    (daily, monthly, or yearly partition).
+    Main orchestration: full or incremental sync for a single timeframe.
+    Always re-check the last partition as incomplete + fill any missing partitions in one pass.
     """
     if not verbose:
         es = f" → {end_date_str}" if end_date_str else ""
@@ -366,91 +367,92 @@ def synchronize_candle_data(exchange: str,
     dir_path      = ensure_directory(exchange, ticker, timeframe)
     gotstart_path = os.path.join(dir_path, ".gotstart")
 
-    # parse end date
+    # parse end date (if any)
     if end_date_str:
         fmt = "%Y-%m-%d %H:%M" if " " in end_date_str else "%Y-%m-%d"
         end_date = datetime.strptime(end_date_str, fmt).replace(tzinfo=timezone.utc)
     else:
-        end_date = datetime.now(timezone.utc)
+        end_date = None
 
     # FULL SYNC
     if not os.path.exists(gotstart_path):
         print(f"{WARNING} No '.gotstart' file found. Starting full historical sync for {timeframe}...")
-        _sync_range(dir_path, ticker, timeframe,
-                    datetime(1970,1,1, tzinfo=timezone.utc), end_date,
-                    gotstart_path, True)
+        _sync_range(
+            dir_path, ticker, timeframe,
+            datetime(1970,1,1, tzinfo=timezone.utc),  # Start from epoch
+            end_date,
+            gotstart_path, True
+        )
         return True
 
     # INCREMENTAL SYNC
-    print(f"{INFO} '.gotstart' exists for {timeframe}. Verifying data continuity...")
+    print(f"{INFO} '.gotstart' exists for {timeframe}. Checking missing partitions...")
+
+    # Gather existing CSV files
     files = sorted(f for f in os.listdir(dir_path) if f.endswith(".csv"))
     if not files:
+        # Marker is there, but no data files => do a full sync
         print(f"{WARNING} Marker present but no CSVs. Re-running full sync for {timeframe}.")
         os.remove(gotstart_path)
         return synchronize_candle_data(exchange, ticker, timeframe, end_date_str, verbose)
 
-    # find earliest known partition
-    earliest_str = files[0][:-4]
-    try:
-        if timeframe == "1m":
-            earliest_dt = datetime.strptime(earliest_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        elif timeframe == "1h":
-            earliest_dt = datetime.strptime(earliest_str, "%Y-%m").replace(day=1, tzinfo=timezone.utc)
-        else:
-            earliest_dt = datetime.strptime(earliest_str, "%Y").replace(month=1, day=1, tzinfo=timezone.utc)
-    except:
-        earliest_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    # We'll fill up to "fill_end"
+    fill_end = end_date if end_date else datetime.now(timezone.utc)
 
-    # First, fill any older missing partitions:
-    missing = find_missing_partitions(dir_path, timeframe, earliest_dt, end_date)
-    for mp in missing:
-        print(f"{WARNING} Filling gap: {mp} for {timeframe}")
-        if timeframe == "1m":
-            s_dt = datetime.strptime(mp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            e_dt = s_dt
-        elif timeframe == "1h":
-            s_dt = datetime.strptime(mp, "%Y-%m").replace(day=1, tzinfo=timezone.utc)
-            year = s_dt.year + (s_dt.month // 12)
-            month = (s_dt.month % 12) + 1
-            nm = s_dt.replace(year=year, month=month, day=1)
-            e_dt = (nm - timedelta(days=1)).replace(hour=23, minute=59, second=59)
-        else:  # 1D
-            s_dt = datetime.strptime(mp, "%Y").replace(month=1, day=1, tzinfo=timezone.utc)
-            e_dt = s_dt.replace(month=12, day=31, hour=23, minute=59, second=59)
-        if e_dt > end_date:
-            e_dt = end_date
+    # Find the earliest existing partition (for reference)
+    earliest_file = files[0][:-4]
+    earliest_dt = parse_partition_date(timeframe, earliest_file)
 
-        _sync_range(dir_path, ticker, timeframe, s_dt, e_dt, gotstart_path, False)
+    # Find the last existing partition (always re-fetch from its start)
+    last_file = files[-1][:-4]
+    last_dt_start = parse_partition_date(timeframe, last_file)
 
-    # Next, truly incremental from the last-known candle forward,
-    # but ensuring we refresh that last candle:
-    last_ts = get_last_file_timestamp(dir_path)
-    if last_ts is not None:
-        # Subtract 1 millisecond to ensure we re-fetch that last candle
-        # (in case it was incomplete earlier).
-        # Also ensure we don't go below epoch:
-        refetch_dt = datetime.fromtimestamp(max(0, last_ts - 1) / 1000, timezone.utc)
-        if refetch_dt < datetime(1970, 1, 1, tzinfo=timezone.utc):
-            refetch_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        start_dt = refetch_dt
+    # Missing partitions from earliest_dt..fill_end
+    missing = find_missing_partitions(dir_path, timeframe, earliest_dt, fill_end)
 
-        if start_dt <= end_date:
-            print(f"{INFO} Incremental sync from {start_dt} to {end_date} for {timeframe} ...")
-            _sync_range(dir_path, ticker, timeframe, start_dt, end_date, gotstart_path, False)
-        else:
-            print(f"{INFO} Data already up to or beyond {end_date}. No incremental fetch needed.")
+    # If there are missing partitions, find the earliest missing's start date
+    if missing:
+        earliest_missing_str = missing[0]
+        earliest_missing_dt = parse_partition_date(timeframe, earliest_missing_str)
+        # We'll re-fetch from whichever is earlier: the earliest missing, or the last partition
+        fetch_start = min(earliest_missing_dt, last_dt_start)
+    else:
+        # If no missing partitions, we still refresh from the last partition start
+        fetch_start = last_dt_start
 
-    # Final report
+    print(f"{WARNING} Will refresh from {fetch_start.date()} onward to ensure last partition is updated.")
+    _sync_range(
+        dir_path, ticker, timeframe,
+        fetch_start, fill_end,
+        gotstart_path, False
+    )
+
+    # Final report of the last known timestamp
     last_ts_final = get_last_file_timestamp(dir_path)
     if last_ts_final:
-        lt = datetime.fromtimestamp(last_ts_final/1000, timezone.utc)
+        lt = datetime.fromtimestamp(last_ts_final / 1000, timezone.utc)
         print(f"{INFO} Final latest timestamp for {timeframe}: "
               f"{COLOR_TIMESTAMPS}{lt:%Y-%m-%d %H:%M:%S UTC}{Style.RESET_ALL}")
 
     return True
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Sync candle data from Bitfinex.")
+    parser.add_argument("--exchange", required=True, help="Exchange name, e.g. BITFINEX")
+    parser.add_argument("--ticker", required=True, help="Ticker symbol, e.g. tBTCUSD")
+    parser.add_argument("--timeframe", required=False, default="1m", help="Timeframe to sync (1m, 1h, 1D).")
+    parser.add_argument("--end", required=False, help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
+    args = parser.parse_args()
 
-if __name__=="__main__":
-    # Main functionality has been moved to example.py
-    print("Please run example.py instead.")
-    print("Example: python example.py --exchange BITFINEX --ticker tBTCUSD")
+    # If you want to sync multiple timeframes automatically, you could do so,
+    # but here we just sync the single user-specified timeframe:
+    print(f"{INFO} Synchronizing single timeframe: {args.timeframe}")
+    res = synchronize_candle_data(
+        args.exchange,
+        args.ticker,
+        args.timeframe,
+        end_date_str=args.end,
+        verbose=True
+    )
+    if res:
+        print(f"\n{SUCCESS} Synchronization completed successfully for timeframe: {args.timeframe}.\n")
