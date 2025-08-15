@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "candles_sync"
+# Keep version centralized in candles_sync/__init__.py
+dynamic = ["version"]
+description = "A utility to synchronize historical candle data from Bitfinex"
+readme = { text = "A utility to synchronize historical candle data from Bitfinex", content-type = "text/plain" }
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Bwahharharrr", email = "your.email@example.com" }]
+keywords = ["bitfinex", "candles", "ohlcv", "trading", "data", "sync"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+dependencies = [
+  "requests>=2.32.3",
+  "pandas>=2.2.3",
+  "colorama>=0.4.6"
+]
+
+[project.urls]
+Homepage = "https://github.com/Bwahharharrr/candles-sync"
+Repository = "https://github.com/Bwahharharrr/candles-sync"
+
+[project.scripts]
+# Wire CLI to candles_sync/candles_sync.py:main
+candles-sync = "candles_sync.candles_sync:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "candles_sync.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["candles_sync"]
+exclude = ["tests*", "docs*"]
