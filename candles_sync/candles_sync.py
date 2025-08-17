@@ -862,6 +862,17 @@ def _fill_missing_partitions_by_group(
 
     return last_ts_so_far
 
+def _utc_now_str() -> str:
+    """Return current UTC time formatted for logs."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def _trace_utc(msg: str) -> None:
+    """Emit a [TRACE] line with an explicit UTC timestamp prefix."""
+    print(f"{TRACE} [{_utc_now_str()} UTC] {msg}", flush=True)
+
+
+# --- REPLACEMENT: drop this whole function in place of your existing one --- #
+
 def synchronize_candle_data(
     exchange: str,
     ticker: str,
@@ -872,6 +883,12 @@ def synchronize_candle_data(
 ) -> bool:
     """
     Main function to sync historical candles from Bitfinex for a single timeframe.
+
+    Improvements in this version:
+    - Eliminates the silent delay between "Missing N partition(s)..." and the first group print
+      by (a) replacing an O(N) pandas scan across all CSVs with the fast tail scanner and
+      (b) adding explicit, timestamped TRACE logs that bracket each expensive step.
+    - All added trace lines use explicit UTC timestamps in 'YYYY-MM-DD HH:MM:SS' format.
     """
     if timeframe not in VALID_TIMEFRAMES:
         if not polling:
@@ -939,23 +956,52 @@ def synchronize_candle_data(
 
     if missing:
         if not polling:
-            print(f"{WARNING} Missing {len(missing)} partition(s). Rebuilding missing partitions:\n")
+            print(f"{WARNING} Missing {len(missing)} partition(s). Rebuilding missing partitions:\n", flush=True)
+
+        # ---- Added, visible TRACE with UTC: bracket the expensive steps in this gap ---- #
+
+        # Step 1: grouping the missing partitions into consecutive runs
+        t_grp_start = time.perf_counter()
+        _trace_utc(f"Step 1/2: Grouping {len(missing)} missing partition(s) into consecutive runs...")
         grouped = _group_consecutive_partitions(timeframe, missing)
+        t_grp_end = time.perf_counter()
+        _trace_utc(f"Step 1/2 complete: {len(grouped)} run(s) in {(t_grp_end - t_grp_start):.3f}s.")
 
-        last_ts_so_far: Optional[int] = None
-        for fcsv in files:
-            path = os.path.join(dir_path, fcsv)
-            df_existing = _safe_read_csv(path)
-            if not df_existing.empty and "timestamp" in df_existing.columns:
-                ts_series = _to_int_series(df_existing["timestamp"])
-                if not ts_series.empty:
-                    mx = int(ts_series.max())
-                    if (last_ts_so_far is None) or (mx > last_ts_so_far):
-                        last_ts_so_far = mx
+        # Step 2: determine the last recorded candle timestamp quickly (fast tail scan)
+        # Choose FS scan trace mode: env override, else 'progress' when verbose, else 'off'.
+        env_mode = (os.getenv(ENV_FS_TRACE) or "").strip().lower()
+        if env_mode in ("off", "progress", "detailed"):
+            fs_trace_mode_for_scan = env_mode
+        else:
+            fs_trace_mode_for_scan = "progress" if (verbose and not polling) else "off"
 
+        t_scan_start = time.perf_counter()
+        _trace_utc(
+            f"Step 2/2: Scanning existing CSV partitions to find last recorded timestamp "
+            f"(dir={dir_path}, files={len(files)}, mode={fs_trace_mode_for_scan})."
+        )
+
+        # IMPORTANT: This replaces the previous O(N) pandas read of every CSV.
+        # It uses the fast tail scanner + minimal pandas fallback (timestamp col only).
+        last_ts_so_far: Optional[int] = get_last_file_timestamp(
+            dir_path, polling=polling, fs_trace_mode=fs_trace_mode_for_scan
+        )
+
+        t_scan_end = time.perf_counter()
+        if last_ts_so_far is None:
+            _trace_utc(f"Scan complete in {(t_scan_end - t_scan_start):.3f}s; no existing timestamps found.")
+        else:
+            last_human = datetime.fromtimestamp(last_ts_so_far / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            _trace_utc(
+                f"Scan complete in {(t_scan_end - t_scan_start):.3f}s; "
+                f"last_ts={last_ts_so_far} ({last_human})."
+            )
+
+        # Now proceed to fill the grouped missing partitions (this prints the Group 1... lines)
         last_ts_so_far = _fill_missing_partitions_by_group(
             dir_path, ticker, timeframe, grouped, last_ts_so_far, fill_end_ms, polling=polling
         )
+
     else:
         if not polling:
             print(f"{INFO} No missing partitions detected. Data seems up to date for {timeframe}.")
