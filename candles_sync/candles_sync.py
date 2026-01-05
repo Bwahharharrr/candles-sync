@@ -490,7 +490,7 @@ def fetch_bitfinex_candles(
                     poll_print(f"  last : mts {_fmt_mts_map(l_mts)}  [{_fmt_ohlcv_inline(last)}]")
 
                 elapsed = time.perf_counter() - t0
-                poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}, time now: {datetime.now().isoformat(timespec="microseconds")}")
+                poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}, time now: {datetime.now().isoformat(timespec='microseconds')}")
                 
                 return data
 
@@ -618,8 +618,14 @@ def _fetch_and_save_range(
     *,
     polling: bool = False,
     write_fn: Callable[[pd.DataFrame, str], int] = write_partition,
+    genesis_floor_ms: Optional[int] = None,
 ) -> None:
-    """Fetch ascending chunks within [start_ms, end_ms] and persist them into partition CSVs."""
+    """Fetch ascending chunks within [start_ms, end_ms] and persist them into partition CSVs.
+    
+    genesis_floor_ms: If provided, never create empty partitions before this timestamp.
+                      This prevents creating spurious empty files for periods before
+                      any data actually exists.
+    """
     cur = int(start_ms)
     tf = to_timeframe_key(tf)
     interval = _get_interval_ms(tf)
@@ -627,24 +633,35 @@ def _fetch_and_save_range(
     while cur <= end_ms:
         raw = fetch_bitfinex_candles(ticker, tf, cur, end=end_ms, limit=API_LIMIT, polling=polling)
         if not raw:
-            if cur <= end_ms:
-                _create_empty_partitions(dir_path, tf, cur, end_ms, polling=polling)
+            # Only create empties from genesis floor onwards (not before data exists)
+            empty_start = cur
+            if genesis_floor_ms is not None:
+                empty_start = max(cur, genesis_floor_ms)
+            if empty_start <= end_ms:
+                _create_empty_partitions(dir_path, tf, empty_start, end_ms, polling=polling)
             break
 
         candles = _audit_api_chunk_fill_internal_gaps(tf, raw, polling=polling)
         if not candles:
             # Nothing came back; avoid infinite loop
-            if cur <= end_ms:
-                _create_empty_partitions(dir_path, tf, cur, end_ms, polling=polling)
+            empty_start = cur
+            if genesis_floor_ms is not None:
+                empty_start = max(cur, genesis_floor_ms)
+            if empty_start <= end_ms:
+                _create_empty_partitions(dir_path, tf, empty_start, end_ms, polling=polling)
             break
 
         df = pd.DataFrame(candles, columns=CSV_COLUMNS, dtype=str)
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").dropna().astype(int)
 
-        # Make empty files for partitions before the first returned candle in this chunk
+        # Make empty files for partitions before the first returned candle in this chunk,
+        # but NEVER before the genesis floor (the first known candle for this symbol).
         earliest = int(df["timestamp"].min())
-        if earliest > cur:
-            _create_empty_partitions(dir_path, tf, cur, min(earliest - 1, end_ms), polling=polling)
+        empty_start = cur
+        if genesis_floor_ms is not None:
+            empty_start = max(cur, genesis_floor_ms)
+        if earliest > empty_start:
+            _create_empty_partitions(dir_path, tf, empty_start, min(earliest - 1, end_ms), polling=polling)
 
         # Partition and write
         df["partition"] = df["timestamp"].apply(lambda ts: Partition.from_timestamp(tf, int(ts)).name)
@@ -737,8 +754,12 @@ def synchronize_candle_data(
                         log_info(f"First complete partition written ({c_file(part_name)}) → created {GOTSTART_FILE}")
             return result
 
-        # Dependency-inject the writer to avoid global monkey-patching
-        _fetch_and_save_range(ticker, timeframe, dir_path, genesis_ms, end_ms, polling=polling, write_fn=safe_write_partition)
+        # Pass genesis_ms as the floor to prevent empty partitions before data exists
+        _fetch_and_save_range(
+            ticker, timeframe, dir_path, genesis_ms, end_ms,
+            polling=polling, write_fn=safe_write_partition,
+            genesis_floor_ms=genesis_ms
+        )
 
         # Final fallback: if somehow never triggered, create anyway
         if not os.path.exists(gotstart):
@@ -771,6 +792,9 @@ def synchronize_candle_data(
     missing = sorted(needed - existing, key=lambda n: Partition.from_name(timeframe, n).start)
 
     last_ts = last_timestamp_in_dir(dir_path) or 0
+    
+    # For incremental sync, use the earliest existing file's start as the genesis floor
+    genesis_floor_ms = int(real_start_dt.timestamp() * 1000) if existing_files else None
 
     # Fill missing historical gaps
     for group in _group_consecutive(timeframe, missing):
@@ -782,7 +806,10 @@ def synchronize_candle_data(
             continue
         if verbose and not polling:
             log_info(f"Filling gap: {c_file(first.name)} → {c_file(last.name)} ({c_rows(len(group))} partitions)")
-        _fetch_and_save_range(ticker, timeframe, dir_path, start_ms, group_end_ms, polling=polling)
+        _fetch_and_save_range(
+            ticker, timeframe, dir_path, start_ms, group_end_ms,
+            polling=polling, genesis_floor_ms=genesis_floor_ms
+        )
         last_ts = last_timestamp_in_dir(dir_path) or last_ts
 
     # Always refresh current partition
@@ -805,7 +832,10 @@ def synchronize_candle_data(
             dt = datetime.fromtimestamp(refresh_start_ms / 1000, tz=timezone.utc)
             log_info(f"Refreshing current partition {c_file(current_partition.name)} from {c_ts(dt.strftime('%Y-%m-%d %H:%M'))} → now")
 
-    _fetch_and_save_range(ticker, timeframe, dir_path, refresh_start_ms, end_ms, polling=polling)
+    _fetch_and_save_range(
+        ticker, timeframe, dir_path, refresh_start_ms, end_ms,
+        polling=polling, genesis_floor_ms=genesis_floor_ms
+    )
 
     latest = last_timestamp_in_dir(dir_path)
     if latest and not polling:
