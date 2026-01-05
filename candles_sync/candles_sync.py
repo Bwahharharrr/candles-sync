@@ -206,7 +206,10 @@ def _safe_join_and_assert_within_root(root: Path, *parts: str) -> Path:
 def ensure_directory(exchange: str, ticker: str, timeframe: str, *, polling: bool = False) -> str:
     """Create (or confirm) the data directory and return its path as a string."""
     root = ROOT_PATH
+    # Ensure root exists first (before path resolution)
+    root.mkdir(parents=True, exist_ok=True)
     dir_path = _safe_join_and_assert_within_root(root, exchange, "candles", ticker, timeframe)
+    # Create all intermediate directories: exchange/, exchange/candles/, exchange/candles/ticker/, etc.
     dir_path.mkdir(parents=True, exist_ok=True)
     if not polling:
         log_info(f"Using directory: {c_dir(dir_path)}")
@@ -701,6 +704,8 @@ def synchronize_candle_data(
     verbose: bool = False,
     polling: bool = False,
 ) -> bool:
+    # Normalize exchange to uppercase (defensive for library usage)
+    exchange = normalize_exchange(exchange)
     timeframe = to_timeframe_key(timeframe)
     dir_path = ensure_directory(exchange, ticker, timeframe, polling=polling)
     gotstart = os.path.join(dir_path, GOTSTART_FILE)
