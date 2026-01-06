@@ -47,6 +47,13 @@ except ImportError:
             return ''
     Fore = Style = NoColor()  # type: ignore[attr-defined]
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    tqdm = None  # type: ignore[assignment]
+
 # ------------------------------ Constants --------------------------------- #
 
 USER_AGENT = "CandleSync/1.0"
@@ -93,6 +100,9 @@ DATE_FMT_MONTH = "%Y-%m"
 DATE_FMT_YEAR = "%Y"
 
 INTERVAL_MS = {"1m": 60_000, "1h": 3_600_000, "1D": 86_400_000}
+
+# Progress bar threshold - show progress when scanning more than this many files
+PROGRESS_THRESHOLD = 100
 
 # ------------------------------ Logging helpers --------------------------- #
 
@@ -368,25 +378,94 @@ def write_partition(df: pd.DataFrame, path: str) -> int:
     merged.to_csv(path, index=False)
     return int(len(merged) - len(old))
 
-def last_timestamp_in_dir(dir_path: str) -> Optional[int]:
+def _read_last_timestamp_from_file(path: str) -> Optional[int]:
+    """Read the last timestamp from a single CSV file. Returns None if file is empty/invalid."""
+    try:
+        size = os.path.getsize(path)
+        if size <= 50:  # header-only or empty
+            return None
+        ts_col = pd.read_csv(path, usecols=["timestamp"]).iloc[-1, 0]
+        return int(float(ts_col))
+    except Exception:
+        return None
+
+def last_timestamp_in_dir(dir_path: str, *, debug: bool = False, full_scan: bool = False) -> Optional[int]:
     """
-    Read only the 'timestamp' column and grab the last row for each CSV.
-    Practical, simple and fast enough in practice (O(N) with tiny scans).
+    Find the latest timestamp across all CSV files in the directory.
+    
+    Optimized: Since files are named chronologically (YYYY-MM-DD, YYYY-MM, YYYY),
+    we scan in reverse order and return as soon as we find a valid timestamp.
+    This makes the common case O(1) instead of O(N).
+    
+    Args:
+        dir_path: Directory containing CSV files
+        debug: Enable detailed trace logging
+        full_scan: Force scanning all files (for debugging/verification)
+    
+    Returns:
+        The maximum timestamp found, or None if no valid timestamps exist.
     """
+    csv_files = sorted([f for f in os.listdir(dir_path) if f.endswith(".csv")])
+    
+    if not csv_files:
+        if debug:
+            log_trace(f"last_timestamp_in_dir: {c_dir(dir_path)} contains no CSV files")
+        return None
+    
+    if debug:
+        log_trace(f"last_timestamp_in_dir: scanning {c_dir(dir_path)}")
+        log_trace(f"  Found {c_rows(len(csv_files))} CSV files")
+    
+    # Optimized path: scan in reverse order, return first valid timestamp
+    if not full_scan:
+        for f in reversed(csv_files):
+            full = os.path.join(dir_path, f)
+            ts = _read_last_timestamp_from_file(full)
+            if ts is not None:
+                if debug:
+                    log_trace(f"  {c_file(f)}: last_ts={c_ts(ts)} ({_fmt_ts_utc(ts)})")
+                    log_trace(f"  Result: {c_ts(ts)} ({_fmt_ts_utc(ts)}) [optimized: checked 1 file]")
+                return ts
+        
+        if debug:
+            log_trace(f"  Result: None (no valid timestamps found)")
+        return None
+    
+    # Full scan path (with progress bar for large directories)
     timestamps: List[int] = []
-    for f in sorted(os.listdir(dir_path)):
-        if not f.endswith(".csv"):
-            continue
+    
+    # Determine if we should show a progress bar
+    show_progress = TQDM_AVAILABLE and len(csv_files) >= PROGRESS_THRESHOLD and not debug
+    
+    if show_progress:
+        iterator = tqdm(
+            csv_files,
+            desc="Scanning CSV files",
+            unit="file",
+            leave=False,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+        )
+    else:
+        iterator = csv_files
+    
+    for f in iterator:
         full = os.path.join(dir_path, f)
-        try:
-            if os.path.getsize(full) <= 50:  # header-only or empty
-                continue
-            ts_col = pd.read_csv(full, usecols=["timestamp"]).iloc[-1, 0]
-            ts = int(pd.to_numeric([ts_col], errors="coerce").dropna().astype(int)[0])
+        ts = _read_last_timestamp_from_file(full)
+        if ts is not None:
             timestamps.append(ts)
-        except Exception:
-            continue
-    return max(timestamps) if timestamps else None
+            if debug and f == csv_files[-1]:
+                log_trace(f"  {c_file(f)}: last_ts={c_ts(ts)} ({_fmt_ts_utc(ts)})")
+        elif debug:
+            size = os.path.getsize(full) if os.path.exists(full) else 0
+            log_trace(f"  {c_file(f)}: skipped (size={size} or read error)")
+    
+    result = max(timestamps) if timestamps else None
+    if debug:
+        if result:
+            log_trace(f"  Result: {c_ts(result)} ({_fmt_ts_utc(result)})")
+        else:
+            log_trace(f"  Result: None (no valid timestamps found)")
+    return result
 
 def _group_consecutive(tf: str, names: List[str]) -> List[List[str]]:
     """Group partition names into consecutive runs (per timeframe)."""
@@ -796,7 +875,20 @@ def synchronize_candle_data(
     needed = {p.name for p in Partition.all_between(timeframe, real_start_dt, end_dt)}
     missing = sorted(needed - existing, key=lambda n: Partition.from_name(timeframe, n).start)
 
-    last_ts = last_timestamp_in_dir(dir_path) or 0
+    # DEBUG: show what we computed
+    if verbose and not polling:
+        log_trace(f"existing files: {c_rows(len(existing_files))}, needed partitions: {c_rows(len(needed))}, missing: {c_rows(len(missing))}")
+        if missing:
+            log_trace(f"  missing range: {c_file(missing[0])} → {c_file(missing[-1])}")
+
+    last_ts = last_timestamp_in_dir(dir_path, debug=verbose) or 0
+    
+    # DEBUG: show last_ts
+    if verbose and not polling:
+        if last_ts:
+            log_trace(f"last_ts from dir: {c_ts(last_ts)} ({_fmt_ts_utc(last_ts)})")
+        else:
+            log_trace(f"last_ts from dir: {c_rows('0 (None returned)')}")
     
     # For incremental sync, use the earliest existing file's start as the genesis floor
     genesis_floor_ms = int(real_start_dt.timestamp() * 1000) if existing_files else None
@@ -805,11 +897,28 @@ def synchronize_candle_data(
     for group in _group_consecutive(timeframe, missing):
         first = Partition.from_name(timeframe, group[0])
         last = Partition.from_name(timeframe, group[-1])
-        start_ms = min(last_ts + 1, int(first.start.timestamp() * 1000))
+        
+        # Calculate start_ms: use last_ts + 1 if we have valid data, otherwise partition start
+        first_start_ms = int(first.start.timestamp() * 1000)
+        if last_ts > 0:
+            # We have existing data - start from where we left off
+            start_ms = min(last_ts + 1, first_start_ms)
+        else:
+            # No valid last_ts (shouldn't happen in incremental sync) - start from partition
+            start_ms = first_start_ms
+        
         group_end_ms = min(int(last.end.timestamp() * 1000), end_ms)
+        
+        # DEBUG: show computation
+        if verbose and not polling:
+            log_trace(f"Gap fill computation:")
+            log_trace(f"  last_ts = {c_var(last_ts)} ({_fmt_ts_utc(last_ts) if last_ts else 'N/A'})")
+            log_trace(f"  first.start = {c_ts(first_start_ms)} ({first.start})")
+            log_trace(f"  => start_ms = {c_var(start_ms)} ({_fmt_ts_utc(start_ms)})")
+        
         if start_ms > group_end_ms:
             continue
-        if verbose and not polling:
+        if not polling:
             log_info(f"Filling gap: {c_file(first.name)} → {c_file(last.name)} ({c_rows(len(group))} partitions)")
         _fetch_and_save_range(
             ticker, timeframe, dir_path, start_ms, group_end_ms,
