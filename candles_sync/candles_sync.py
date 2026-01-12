@@ -587,7 +587,7 @@ def fetch_bitfinex_candles(
                     elif n == 1:
                         first_dt = datetime.fromtimestamp(int(data[0][0]) / 1000, tz=timezone.utc)
                         first_str = first_dt.strftime("%Y-%m-%d %H:%M")
-                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)}")
+                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)} [{_fmt_ohlcv_inline(data[0])}]")
                     else:
                         first_dt = datetime.fromtimestamp(int(data[0][0]) / 1000, tz=timezone.utc)
                         last_dt = datetime.fromtimestamp(int(data[-1][0]) / 1000, tz=timezone.utc)
