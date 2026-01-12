@@ -505,7 +505,8 @@ def fetch_bitfinex_candles(
     end: Optional[int] = None,
     limit: int = API_LIMIT,
     *,
-    polling: bool = False
+    polling: bool = False,
+    debug: bool = False
 ) -> List[List[float]]:
     """
     Fetch up to `limit` candles from Bitfinex in ascending order (sort=1),
@@ -525,8 +526,9 @@ def fetch_bitfinex_candles(
         full = f"{url}?{urlencode(params)}"
         if polling:
             now_utc = datetime.now(timezone.utc)
-            poll_print(f"Now: {c_ts(now_utc.strftime('%Y-%m-%d %H:%M:%S'))} -- {c_var(int(now_utc.timestamp()*1000))}")
-            poll_print(f"Fetching: {c_var(full)}")
+            if debug:
+                poll_print(f"Now: {c_ts(now_utc.strftime('%Y-%m-%d %H:%M:%S'))} -- {c_var(int(now_utc.timestamp()*1000))}")
+                poll_print(f"Fetching: {c_var(full)}")
             t0 = time.perf_counter()
         else:
             log_info(f"GET {c_var(full)}")
@@ -550,30 +552,49 @@ def fetch_bitfinex_candles(
 
             if polling:
                 n = len(data) if data else 0
-                if n == 0:
-                    poll_print("API Returned [0 elements]")
+                now_utc = datetime.now(timezone.utc)
+                now_str = now_utc.strftime("%d %H:%M:%S")
+
+                if debug:
+                    # Verbose debug output
+                    if n == 0:
+                        poll_print("API Returned [0 elements]")
+                        elapsed = time.perf_counter() - t0
+                        poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}")
+                        return data
+
+                    # Show human-readable mapping for timestamps (single or range)
+                    if n == 1:
+                        r = data[0]
+                        mts = int(r[0])
+                        poll_print(f"API Returned [{c_rows(1)} elements]")
+                        poll_print(f"  mts: {_fmt_mts_map(mts)}  [{_fmt_ohlcv_inline(r)}]")
+                    else:
+                        first = data[0]
+                        last  = data[-1]
+                        f_mts = int(first[0])
+                        l_mts = int(last[0])
+                        poll_print(f"API Returned [{c_rows(n)} elements]")
+                        poll_print(f"  first: mts {_fmt_mts_map(f_mts)}  [{_fmt_ohlcv_inline(first)}]")
+                        poll_print(f"  last : mts {_fmt_mts_map(l_mts)}  [{_fmt_ohlcv_inline(last)}]")
+
                     elapsed = time.perf_counter() - t0
-                    poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}")
-                    return data
-
-                # Show human-readable mapping for timestamps (single or range)
-                if n == 1:
-                    r = data[0]
-                    mts = int(r[0])
-                    poll_print(f"API Returned [{c_rows(1)} elements]")
-                    poll_print(f"  mts: {_fmt_mts_map(mts)}  [{_fmt_ohlcv_inline(r)}]")
+                    poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}, time now: {datetime.now().isoformat(timespec='microseconds')}")
                 else:
-                    first = data[0]
-                    last  = data[-1]
-                    f_mts = int(first[0])
-                    l_mts = int(last[0])
-                    poll_print(f"API Returned [{c_rows(n)} elements]")
-                    poll_print(f"  first: mts {_fmt_mts_map(f_mts)}  [{_fmt_ohlcv_inline(first)}]")
-                    poll_print(f"  last : mts {_fmt_mts_map(l_mts)}  [{_fmt_ohlcv_inline(last)}]")
+                    # Compact one-liner output
+                    if n == 0:
+                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(0)} elements]")
+                    elif n == 1:
+                        first_dt = datetime.fromtimestamp(int(data[0][0]) / 1000, tz=timezone.utc)
+                        first_str = first_dt.strftime("%Y-%m-%d %H:%M")
+                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)}")
+                    else:
+                        first_dt = datetime.fromtimestamp(int(data[0][0]) / 1000, tz=timezone.utc)
+                        last_dt = datetime.fromtimestamp(int(data[-1][0]) / 1000, tz=timezone.utc)
+                        first_str = first_dt.strftime("%Y-%m-%d %H:%M")
+                        last_str = last_dt.strftime("%Y-%m-%d %H:%M")
+                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)} -> {c_ts(last_str)}")
 
-                elapsed = time.perf_counter() - t0
-                poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}, time now: {datetime.now().isoformat(timespec='microseconds')}")
-                
                 return data
 
             # non-polling
@@ -602,7 +623,7 @@ def fetch_bitfinex_candles(
 
 # ------------------------------ Gap audit --------------------------------- #
 
-def find_genesis_timestamp(ticker: str, timeframe: str, *, polling: bool = False) -> int:
+def find_genesis_timestamp(ticker: str, timeframe: str, *, polling: bool = False, debug: bool = False) -> int:
     """
     Ask Bitfinex for the very first candle ever traded for this symbol/timeframe.
     We request only 1 candle starting from epoch — Bitfinex returns the earliest one available.
@@ -611,7 +632,7 @@ def find_genesis_timestamp(ticker: str, timeframe: str, *, polling: bool = False
     if polling:
         poll_print("Discovering genesis candle...")
     raw = fetch_bitfinex_candles(
-        ticker, timeframe, start=0, limit=1, polling=polling
+        ticker, timeframe, start=0, limit=1, polling=polling, debug=debug
     )
     if not raw:
         if not polling:
@@ -699,6 +720,7 @@ def _fetch_and_save_range(
     end_ms: int,
     *,
     polling: bool = False,
+    debug: bool = False,
     write_fn: Callable[[pd.DataFrame, str], int] = write_partition,
     genesis_floor_ms: Optional[int] = None,
 ) -> None:
@@ -713,7 +735,7 @@ def _fetch_and_save_range(
     interval = _get_interval_ms(tf)
 
     while cur <= end_ms:
-        raw = fetch_bitfinex_candles(ticker, tf, cur, end=end_ms, limit=API_LIMIT, polling=polling)
+        raw = fetch_bitfinex_candles(ticker, tf, cur, end=end_ms, limit=API_LIMIT, polling=polling, debug=debug)
         if not raw:
             # Only create empties from genesis floor onwards (not before data exists)
             empty_start = cur
@@ -782,6 +804,7 @@ def synchronize_candle_data(
     end_date_str: Optional[str] = None,
     verbose: bool = False,
     polling: bool = False,
+    debug: bool = False,
 ) -> bool:
     # Normalize exchange to uppercase (defensive for library usage)
     exchange = normalize_exchange(exchange)
@@ -810,7 +833,7 @@ def synchronize_candle_data(
             if not polling:
                 log_warn("First-time sync — discovering genesis candle...")
 
-        genesis_ms = find_genesis_timestamp(ticker, timeframe, polling=polling)
+        genesis_ms = find_genesis_timestamp(ticker, timeframe, polling=polling, debug=debug)
         if not polling:
             genesis_dt = datetime.fromtimestamp(genesis_ms / 1000, tz=timezone.utc)
             log_info(f"Genesis candle: {c_ts(genesis_dt.strftime('%Y-%m-%d %H:%M UTC'))} — starting full sync")
@@ -841,7 +864,7 @@ def synchronize_candle_data(
         # Pass genesis_ms as the floor to prevent empty partitions before data exists
         _fetch_and_save_range(
             ticker, timeframe, dir_path, genesis_ms, end_ms,
-            polling=polling, write_fn=safe_write_partition,
+            polling=polling, debug=debug, write_fn=safe_write_partition,
             genesis_floor_ms=genesis_ms
         )
 
@@ -922,7 +945,7 @@ def synchronize_candle_data(
             log_info(f"Filling gap: {c_file(first.name)} → {c_file(last.name)} ({c_rows(len(group))} partitions)")
         _fetch_and_save_range(
             ticker, timeframe, dir_path, start_ms, group_end_ms,
-            polling=polling, genesis_floor_ms=genesis_floor_ms
+            polling=polling, debug=debug, genesis_floor_ms=genesis_floor_ms
         )
         last_ts = last_timestamp_in_dir(dir_path) or last_ts
 
@@ -948,7 +971,7 @@ def synchronize_candle_data(
 
     _fetch_and_save_range(
         ticker, timeframe, dir_path, refresh_start_ms, end_ms,
-        polling=polling, genesis_floor_ms=genesis_floor_ms
+        polling=polling, debug=debug, genesis_floor_ms=genesis_floor_ms
     )
 
     latest = last_timestamp_in_dir(dir_path)
@@ -969,8 +992,8 @@ def main() -> int:
         "--timeframe", required=False, default="1m", choices=sorted(VALID_TIMEFRAMES), help="Timeframe to sync (1m, 1h, 1D)"
     )
     parser.add_argument("--end", required=False, help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
-    parser.add_argument("--polling", action="store_true", help="Compact output intended for polling mode")
-    parser.add_argument("--verbose", action="store_true", help="More chatty logs")
+    parser.add_argument("--polling", action="store_true", help="Compact one-liner output for live polling")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output (debug mode for polling)")
     args = parser.parse_args()
 
     exchange = normalize_exchange(args.exchange)
@@ -987,6 +1010,7 @@ def main() -> int:
         end_date_str=args.end,
         verbose=args.verbose,
         polling=args.polling,
+        debug=args.verbose,
     )
     if ok:
         log_success("Synchronization completed.")
