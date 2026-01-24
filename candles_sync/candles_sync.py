@@ -958,7 +958,8 @@ def synchronize_candle_data(
     if os.path.exists(current_csv):
         try:
             latest = pd.read_csv(current_csv, usecols=["timestamp"])["timestamp"].astype(int).max()
-            refresh_start_ms = latest  # inclusive re-fetch
+            if not pd.isna(latest):  # Handle empty CSV files (header only)
+                refresh_start_ms = latest  # inclusive re-fetch
         except Exception:
             pass
 
