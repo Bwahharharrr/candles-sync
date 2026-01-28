@@ -37,6 +37,8 @@ import pandas as pd
 import requests
 from urllib.parse import urlencode
 
+from .adapters import get_adapter, ExchangeAdapter, Candle
+
 try:
     import colorama
     from colorama import Fore, Style
@@ -82,14 +84,9 @@ COLOR_TYPE       = Fore.YELLOW
 COLOR_DESC       = Fore.MAGENTA
 COLOR_REQ        = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
 
-BITFINEX_API_URL = "https://api-pub.bitfinex.com/v2/candles/trade:{}:{}/hist"
-
 ROOT_PATH = Path.home() / ".corky"
 
-API_LIMIT = 10_000
 HTTP_TIMEOUT_SECONDS = 30
-BACKOFF_INITIAL_SECONDS = 30
-BACKOFF_MAX_SECONDS = 300
 
 VALID_TIMEFRAMES = {"1m", "1h", "1D"}
 CSV_COLUMNS = ["timestamp", "open", "close", "high", "low", "volume"]
@@ -496,31 +493,59 @@ def _create_empty_partitions(dir_path: str, tf: str, start_ms: int, end_ms: int,
             if not polling:
                 log_new(f"Empty partition created: {c_file(p.name)}")
 
-# ------------------------------ Bitfinex API ------------------------------ #
+# ------------------------------ Generic Fetch API -------------------------- #
 
-def fetch_bitfinex_candles(
+def _fmt_candle_inline(candle: Candle) -> str:
+    """Format a Candle for logging output."""
+    o = _canonical_num_str(candle.open)
+    c = _canonical_num_str(candle.close)
+    h = _canonical_num_str(candle.high)
+    l = _canonical_num_str(candle.low)
+    v = _canonical_num_str(candle.volume)
+    return c_desc(f"O:{o} C:{c} H:{h} L:{l} V:{v}")
+
+
+def fetch_candles(
+    adapter: ExchangeAdapter,
     symbol: str,
     timeframe: str,
     start: int,
     end: Optional[int] = None,
-    limit: int = API_LIMIT,
+    limit: Optional[int] = None,
     *,
     polling: bool = False,
     debug: bool = False
-) -> List[List[float]]:
+) -> List[Candle]:
     """
-    Fetch up to `limit` candles from Bitfinex in ascending order (sort=1),
-    starting at `start` (inclusive) and up to `end` if provided.
+    Fetch candles using the provided adapter.
 
-    API rows: [mts, open, close, high, low, volume]
+    Args:
+        adapter: Exchange adapter instance
+        symbol: Exchange-formatted symbol
+        timeframe: Internal timeframe key ('1m', '1h', '1D')
+        start: Start timestamp in milliseconds
+        end: End timestamp in milliseconds (optional)
+        limit: Maximum candles to fetch (optional, uses adapter default)
+        polling: Compact output mode for live polling
+        debug: Verbose debug output
+
+    Returns:
+        List of Candle objects in ascending order by timestamp
     """
-    url = BITFINEX_API_URL.format(to_timeframe_key(timeframe), symbol)
-    params = {"limit": int(limit), "sort": 1, "start": int(start)}
-    if end is not None:
-        params["end"] = int(end)
+    config = adapter.config
+    exchange_tf = adapter.translate_timeframe(timeframe)
+    url = adapter.build_url(symbol, exchange_tf)
+    params = adapter.build_params(start, end, limit)
 
-    delay = BACKOFF_INITIAL_SECONDS
-    max_delay = BACKOFF_MAX_SECONDS
+    # For adapters that need symbol/interval in params (like Binance)
+    if adapter.name == "BINANCE":
+        params["symbol"] = symbol
+        params["interval"] = exchange_tf
+    elif adapter.name == "YAHOO":
+        params["interval"] = exchange_tf
+
+    delay = config.rate_limit.initial_backoff_seconds
+    max_delay = config.rate_limit.max_backoff_seconds
 
     while True:
         full = f"{url}?{urlencode(params)}"
@@ -534,7 +559,7 @@ def fetch_bitfinex_candles(
             log_info(f"GET {c_var(full)}")
 
         try:
-            resp = requests.get(full, headers=HEADERS, timeout=HTTP_TIMEOUT_SECONDS)
+            resp = requests.get(full, headers=HEADERS, timeout=config.timeout_seconds)
         except Exception as e:
             if not polling:
                 log_error(f"Network error: {c_desc(e)}. Retrying in {c_var(f'{delay}s')}...")
@@ -550,69 +575,65 @@ def fetch_bitfinex_candles(
                     log_error(f"Failed to decode JSON response: {c_desc(e)}")
                 return []
 
+            # Parse response using adapter
+            candles = adapter.parse_response(data)
+
             if polling:
-                n = len(data) if data else 0
+                n = len(candles)
                 now_utc = datetime.now(timezone.utc)
                 now_str = now_utc.strftime("%d %H:%M:%S")
 
                 if debug:
-                    # Verbose debug output
                     if n == 0:
                         poll_print("API Returned [0 elements]")
                         elapsed = time.perf_counter() - t0
                         poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}")
-                        return data
+                        return candles
 
-                    # Show human-readable mapping for timestamps (single or range)
                     if n == 1:
-                        r = data[0]
-                        mts = int(r[0])
+                        c = candles[0]
                         poll_print(f"API Returned [{c_rows(1)} elements]")
-                        poll_print(f"  mts: {_fmt_mts_map(mts)}  [{_fmt_ohlcv_inline(r)}]")
+                        poll_print(f"  mts: {_fmt_mts_map(c.timestamp)}  [{_fmt_candle_inline(c)}]")
                     else:
-                        first = data[0]
-                        last  = data[-1]
-                        f_mts = int(first[0])
-                        l_mts = int(last[0])
+                        first = candles[0]
+                        last = candles[-1]
                         poll_print(f"API Returned [{c_rows(n)} elements]")
-                        poll_print(f"  first: mts {_fmt_mts_map(f_mts)}  [{_fmt_ohlcv_inline(first)}]")
-                        poll_print(f"  last : mts {_fmt_mts_map(l_mts)}  [{_fmt_ohlcv_inline(last)}]")
+                        poll_print(f"  first: mts {_fmt_mts_map(first.timestamp)}  [{_fmt_candle_inline(first)}]")
+                        poll_print(f"  last : mts {_fmt_mts_map(last.timestamp)}  [{_fmt_candle_inline(last)}]")
 
                     elapsed = time.perf_counter() - t0
                     poll_print(f"Finished in {c_var(f'{elapsed:.3f}s')}, time now: {datetime.now().isoformat(timespec='microseconds')}")
                 else:
-                    # Compact one-liner output
                     if n == 0:
                         poll_print(f"[{c_ts(now_str)}] got [{c_rows(0)} elements]")
                     elif n == 1:
-                        first_dt = datetime.fromtimestamp(int(data[0][0]) / 1000, tz=timezone.utc)
+                        first_dt = datetime.fromtimestamp(candles[0].timestamp / 1000, tz=timezone.utc)
                         first_str = first_dt.strftime("%Y-%m-%d %H:%M")
-                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)} [{_fmt_ohlcv_inline(data[0])}]")
+                        poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)} [{_fmt_candle_inline(candles[0])}]")
                     else:
-                        first_dt = datetime.fromtimestamp(int(data[0][0]) / 1000, tz=timezone.utc)
-                        last_dt = datetime.fromtimestamp(int(data[-1][0]) / 1000, tz=timezone.utc)
+                        first_dt = datetime.fromtimestamp(candles[0].timestamp / 1000, tz=timezone.utc)
+                        last_dt = datetime.fromtimestamp(candles[-1].timestamp / 1000, tz=timezone.utc)
                         first_str = first_dt.strftime("%Y-%m-%d %H:%M")
                         last_str = last_dt.strftime("%Y-%m-%d %H:%M")
                         poll_print(f"[{c_ts(now_str)}] got [{c_rows(n)} elements], {c_ts(first_str)} -> {c_ts(last_str)}")
 
-                return data
+                return candles
 
             # non-polling
-            if not data:
+            if not candles:
                 log_warn("API returned 0 candles.")
                 return []
             try:
-                ts = [int(c[0]) for c in data]
-                first_h = datetime.fromtimestamp(min(ts) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                last_h = datetime.fromtimestamp(max(ts) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                log_success(f"Received {c_rows(len(data))} candles ({c_ts(first_h)} → {c_ts(last_h)})")
+                first_h = datetime.fromtimestamp(candles[0].timestamp / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                last_h = datetime.fromtimestamp(candles[-1].timestamp / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                log_success(f"Received {c_rows(len(candles))} candles ({c_ts(first_h)} → {c_ts(last_h)})")
             except Exception:
-                log_success(f"Received {c_rows(len(data))} candles")
-            return data
+                log_success(f"Received {c_rows(len(candles))} candles")
+            return candles
 
-        if resp.status_code == 429:
+        if adapter.is_rate_limited(resp.status_code):
             if not polling:
-                log_warn(f"Rate limit (429). Retrying in {c_var(f'{delay}s')}...")
+                log_warn(f"Rate limit ({resp.status_code}). Retrying in {c_var(f'{delay}s')}...")
             time.sleep(delay)
             delay = min(max_delay, delay * 2)
             continue
@@ -621,24 +642,43 @@ def fetch_bitfinex_candles(
             log_error(f"HTTP {c_var(resp.status_code)}: {c_desc(resp.text)}")
         return []
 
+
+def _candles_to_list_format(candles: List[Candle]) -> List[List[float]]:
+    """Convert Candle objects to list format for backward compatibility."""
+    return [
+        [c.timestamp, c.open, c.close, c.high, c.low, c.volume]
+        for c in candles
+    ]
+
+
 # ------------------------------ Gap audit --------------------------------- #
 
-def find_genesis_timestamp(ticker: str, timeframe: str, *, polling: bool = False, debug: bool = False) -> int:
+def find_genesis_timestamp(
+    adapter: ExchangeAdapter,
+    symbol: str,
+    timeframe: str,
+    *,
+    polling: bool = False,
+    debug: bool = False
+) -> int:
     """
-    Ask Bitfinex for the very first candle ever traded for this symbol/timeframe.
-    We request only 1 candle starting from epoch — Bitfinex returns the earliest one available.
-    This prevents creating 40+ years of empty partitions.
+    Find the very first candle ever traded for this symbol/timeframe.
+    We request only 1 candle starting from epoch to get the earliest one available.
+    This prevents creating decades of empty partitions.
     """
     if polling:
         poll_print("Discovering genesis candle...")
-    raw = fetch_bitfinex_candles(
-        ticker, timeframe, start=0, limit=1, polling=polling, debug=debug
+
+    candles = fetch_candles(
+        adapter, symbol, timeframe, start=0, limit=1, polling=polling, debug=debug
     )
-    if not raw:
+
+    if not candles:
         if not polling:
             log_warn("No candles ever returned — assuming genesis = now")
         return int(datetime.now(timezone.utc).timestamp() * 1000)
-    genesis_ms = int(raw[0][0])  # first candle's MTS
+
+    genesis_ms = candles[0].timestamp
     if not polling:
         genesis_dt = datetime.fromtimestamp(genesis_ms / 1000, tz=timezone.utc)
         log_info(f"Genesis candle found: {c_ts(genesis_dt.strftime('%Y-%m-%d %H:%M:%S UTC'))}")
@@ -662,18 +702,36 @@ def _synthesize_gap_rows(expected_ts: List[int], prev_close_any) -> pd.DataFrame
 
 def _audit_api_chunk_fill_internal_gaps(
     timeframe: str,
-    candles: List[List[float]],
+    candles: List[Candle],
     *,
     polling: bool = False
 ) -> List[List[str]]:
     """
     Audit an API chunk and synthesize missing intervals inside the chunk's first..last window.
     Returns list-of-lists matching CSV_COLUMNS, with canonical strings.
+
+    Args:
+        timeframe: Internal timeframe key ('1m', '1h', '1D')
+        candles: List of Candle objects from the adapter
+        polling: Whether in polling mode (affects logging)
     """
     if not candles:
         return []
 
-    df = pd.DataFrame(candles, columns=CSV_COLUMNS)
+    # Convert Candle objects to DataFrame
+    # CSV_COLUMNS = ["timestamp", "open", "close", "high", "low", "volume"]
+    rows = [
+        {
+            "timestamp": c.timestamp,
+            "open": c.open,
+            "close": c.close,
+            "high": c.high,
+            "low": c.low,
+            "volume": c.volume,
+        }
+        for c in candles
+    ]
+    df = pd.DataFrame(rows, columns=CSV_COLUMNS)
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").dropna().astype("int64")
     df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
 
@@ -713,7 +771,8 @@ def _audit_api_chunk_fill_internal_gaps(
 # ------------------------------ Range fetch & save ------------------------ #
 
 def _fetch_and_save_range(
-    ticker: str,
+    adapter: ExchangeAdapter,
+    symbol: str,
     tf: str,
     dir_path: str,
     start_ms: int,
@@ -725,17 +784,28 @@ def _fetch_and_save_range(
     genesis_floor_ms: Optional[int] = None,
 ) -> None:
     """Fetch ascending chunks within [start_ms, end_ms] and persist them into partition CSVs.
-    
-    genesis_floor_ms: If provided, never create empty partitions before this timestamp.
-                      This prevents creating spurious empty files for periods before
-                      any data actually exists.
+
+    Args:
+        adapter: Exchange adapter instance
+        symbol: Exchange-formatted symbol
+        tf: Internal timeframe key ('1m', '1h', '1D')
+        dir_path: Directory to save partition files
+        start_ms: Start timestamp in milliseconds
+        end_ms: End timestamp in milliseconds
+        polling: Compact output mode for live polling
+        debug: Verbose debug output
+        write_fn: Function to write partition DataFrames to CSV
+        genesis_floor_ms: If provided, never create empty partitions before this timestamp.
+                          This prevents creating spurious empty files for periods before
+                          any data actually exists.
     """
     cur = int(start_ms)
     tf = to_timeframe_key(tf)
     interval = _get_interval_ms(tf)
+    api_limit = adapter.config.limit
 
     while cur <= end_ms:
-        raw = fetch_bitfinex_candles(ticker, tf, cur, end=end_ms, limit=API_LIMIT, polling=polling, debug=debug)
+        raw = fetch_candles(adapter, symbol, tf, cur, end=end_ms, limit=api_limit, polling=polling, debug=debug)
         if not raw:
             # Only create empties from genesis floor onwards (not before data exists)
             empty_start = cur
@@ -782,7 +852,7 @@ def _fetch_and_save_range(
             break
 
         # If we got fewer than limit candles → we are at the end of available data
-        if len(raw) < API_LIMIT:
+        if len(raw) < api_limit:
             if not polling:
                 last_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
                 log_info(f"Reached end of available data at {c_ts(last_dt.strftime('%Y-%m-%d %H:%M UTC'))} ({c_rows(len(raw))} candles in last chunk)")
@@ -809,6 +879,19 @@ def synchronize_candle_data(
     # Normalize exchange to uppercase (defensive for library usage)
     exchange = normalize_exchange(exchange)
     timeframe = to_timeframe_key(timeframe)
+
+    # Get the adapter for this exchange
+    adapter = get_adapter(exchange)
+
+    # Format symbol using the adapter
+    symbol = adapter.format_symbol(ticker)
+
+    # Validate timeframe is supported by this adapter
+    if not adapter.validate_timeframe(timeframe):
+        supported = list(adapter.get_supported_timeframes().keys())
+        log_error(f"Timeframe '{timeframe}' not supported by {adapter.name}. Supported: {supported}")
+        return False
+
     dir_path = ensure_directory(exchange, ticker, timeframe, polling=polling)
     gotstart = os.path.join(dir_path, GOTSTART_FILE)
 
@@ -833,7 +916,7 @@ def synchronize_candle_data(
             if not polling:
                 log_warn("First-time sync — discovering genesis candle...")
 
-        genesis_ms = find_genesis_timestamp(ticker, timeframe, polling=polling, debug=debug)
+        genesis_ms = find_genesis_timestamp(adapter, symbol, timeframe, polling=polling, debug=debug)
         if not polling:
             genesis_dt = datetime.fromtimestamp(genesis_ms / 1000, tz=timezone.utc)
             log_info(f"Genesis candle: {c_ts(genesis_dt.strftime('%Y-%m-%d %H:%M UTC'))} — starting full sync")
@@ -863,7 +946,7 @@ def synchronize_candle_data(
 
         # Pass genesis_ms as the floor to prevent empty partitions before data exists
         _fetch_and_save_range(
-            ticker, timeframe, dir_path, genesis_ms, end_ms,
+            adapter, symbol, timeframe, dir_path, genesis_ms, end_ms,
             polling=polling, debug=debug, write_fn=safe_write_partition,
             genesis_floor_ms=genesis_ms
         )
@@ -905,14 +988,14 @@ def synchronize_candle_data(
             log_trace(f"  missing range: {c_file(missing[0])} → {c_file(missing[-1])}")
 
     last_ts = last_timestamp_in_dir(dir_path, debug=verbose) or 0
-    
+
     # DEBUG: show last_ts
     if verbose and not polling:
         if last_ts:
             log_trace(f"last_ts from dir: {c_ts(last_ts)} ({_fmt_ts_utc(last_ts)})")
         else:
             log_trace(f"last_ts from dir: {c_rows('0 (None returned)')}")
-    
+
     # For incremental sync, use the earliest existing file's start as the genesis floor
     genesis_floor_ms = int(real_start_dt.timestamp() * 1000) if existing_files else None
 
@@ -920,7 +1003,7 @@ def synchronize_candle_data(
     for group in _group_consecutive(timeframe, missing):
         first = Partition.from_name(timeframe, group[0])
         last = Partition.from_name(timeframe, group[-1])
-        
+
         # Calculate start_ms: use last_ts + 1 if we have valid data, otherwise partition start
         first_start_ms = int(first.start.timestamp() * 1000)
         if last_ts > 0:
@@ -929,22 +1012,22 @@ def synchronize_candle_data(
         else:
             # No valid last_ts (shouldn't happen in incremental sync) - start from partition
             start_ms = first_start_ms
-        
+
         group_end_ms = min(int(last.end.timestamp() * 1000), end_ms)
-        
+
         # DEBUG: show computation
         if verbose and not polling:
             log_trace(f"Gap fill computation:")
             log_trace(f"  last_ts = {c_var(last_ts)} ({_fmt_ts_utc(last_ts) if last_ts else 'N/A'})")
             log_trace(f"  first.start = {c_ts(first_start_ms)} ({first.start})")
             log_trace(f"  => start_ms = {c_var(start_ms)} ({_fmt_ts_utc(start_ms)})")
-        
+
         if start_ms > group_end_ms:
             continue
         if not polling:
             log_info(f"Filling gap: {c_file(first.name)} → {c_file(last.name)} ({c_rows(len(group))} partitions)")
         _fetch_and_save_range(
-            ticker, timeframe, dir_path, start_ms, group_end_ms,
+            adapter, symbol, timeframe, dir_path, start_ms, group_end_ms,
             polling=polling, debug=debug, genesis_floor_ms=genesis_floor_ms
         )
         last_ts = last_timestamp_in_dir(dir_path) or last_ts
@@ -971,7 +1054,7 @@ def synchronize_candle_data(
             log_info(f"Refreshing current partition {c_file(current_partition.name)} from {c_ts(dt.strftime('%Y-%m-%d %H:%M'))} → now")
 
     _fetch_and_save_range(
-        ticker, timeframe, dir_path, refresh_start_ms, end_ms,
+        adapter, symbol, timeframe, dir_path, refresh_start_ms, end_ms,
         polling=polling, debug=debug, genesis_floor_ms=genesis_floor_ms
     )
 
