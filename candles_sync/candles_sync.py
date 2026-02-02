@@ -1075,17 +1075,158 @@ def synchronize_candle_data(
 
 # ------------------------------ CLI --------------------------------------- #
 
+def _format_exchanges(exchanges: list, fmt: str) -> str:
+    """Format exchange list for output."""
+    if fmt == "json":
+        import json as _json
+        return _json.dumps({"source": "EODHD", "count": len(exchanges), "exchanges": exchanges}, indent=2)
+    if fmt == "simple":
+        return "\n".join(e.get("Code", "") for e in exchanges)
+    # Table format
+    lines = [f"EODHD Available Exchanges ({len(exchanges)} total):\n"]
+    lines.append(f"  {'Code':<8} {'Name':<35} {'Country'}")
+    lines.append(f"  {'-'*6}   {'-'*33}   {'-'*15}")
+    for e in exchanges:
+        lines.append(f"  {e.get('Code', ''):<8} {e.get('Name', '')[:33]:<35} {e.get('Country', '')[:15]}")
+    return "\n".join(lines)
+
+
+def _format_tickers(tickers: list, exchange: str, fmt: str) -> str:
+    """Format ticker list for output."""
+    if fmt == "json":
+        import json as _json
+        return _json.dumps({"exchange": exchange, "count": len(tickers), "tickers": tickers}, indent=2)
+
+    # For Bitfinex, tickers have 'symbol' key; for EODHD, they have 'Code' key
+    if tickers and "symbol" in tickers[0]:
+        # Bitfinex format
+        symbols = [t.get("symbol", "") for t in tickers]
+        if fmt == "simple":
+            return "\n".join(symbols)
+        # Table format
+        lines = [f"{exchange} Available Tickers ({len(tickers)} total):\n"]
+        lines.append(f"  {'Symbol':<20} {'Raw'}")
+        lines.append(f"  {'-'*18}   {'-'*20}")
+        for t in tickers:
+            lines.append(f"  {t.get('symbol', ''):<20} {t.get('raw', '')}")
+        return "\n".join(lines)
+    else:
+        # EODHD format
+        symbols = [t.get("Code", "") for t in tickers]
+        if fmt == "simple":
+            return "\n".join(symbols)
+        # Table format
+        lines = [f"{exchange} Available Symbols ({len(tickers)} total):\n"]
+        lines.append(f"  {'Code':<12} {'Name':<40} {'Type'}")
+        lines.append(f"  {'-'*10}   {'-'*38}   {'-'*15}")
+        for t in tickers:
+            lines.append(f"  {t.get('Code', ''):<12} {t.get('Name', '')[:38]:<40} {t.get('Type', '')[:15]}")
+        return "\n".join(lines)
+
+
+def _handle_get_exchanges(fmt: str) -> int:
+    """List EODHD exchanges."""
+    from .providers.eodhd import MetadataCache
+    cache = MetadataCache()
+    exchanges = cache.get_exchanges()
+    print(_format_exchanges(exchanges, fmt))
+    return 0
+
+
+def _handle_get_tickers(exchange: str, fmt: str) -> int:
+    """List tickers for an exchange."""
+    exchange_upper = exchange.upper()
+
+    if exchange_upper == "BITFINEX":
+        from .providers.bitfinex import BitfinexMetadataCache
+        cache = BitfinexMetadataCache()
+        tickers = cache.get_tickers()
+    else:
+        # Treat as EODHD sub-exchange (US, LSE, etc.)
+        from .providers.eodhd import MetadataCache
+        cache = MetadataCache()
+        tickers = cache.get_exchange_symbols(exchange_upper)
+
+    print(_format_tickers(tickers, exchange_upper, fmt))
+    return 0
+
+
+def _handle_refresh_metadata() -> int:
+    """Refresh EODHD metadata cache."""
+    from .providers.eodhd import MetadataCache
+    log_info("Refreshing EODHD metadata cache...")
+    cache = MetadataCache()
+    cache.refresh_all()
+    log_success("Metadata cache refreshed successfully.")
+    return 0
+
+
+def _handle_bulk_sync(exchange_code: str, date: str = None, verbose: bool = False) -> int:
+    """Handle EODHD bulk sync for an exchange."""
+    from .providers.eodhd import bulk_sync_exchange
+    log_info(f"Starting bulk sync for exchange: {exchange_code}")
+    results = bulk_sync_exchange(exchange_code, date=date, verbose=verbose)
+    success_count = sum(1 for v in results.values() if v)
+    error_count = sum(1 for v in results.values() if not v)
+    log_success(f"Bulk sync complete: {success_count} tickers succeeded, {error_count} failed")
+    return 0 if error_count == 0 else 1
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sync candle data from Bitfinex.")
-    parser.add_argument("--exchange", required=True, help="Exchange name, e.g. BITFINEX")
-    parser.add_argument("--ticker", required=True, help="Ticker symbol, e.g. tBTCUSD")
+    parser = argparse.ArgumentParser(description="Sync candle data from exchanges.")
+    parser.add_argument("--exchange", help="Exchange name, e.g. BITFINEX, EODHD")
+    parser.add_argument("--ticker", help="Ticker symbol, e.g. tBTCUSD, MCD.US")
     parser.add_argument(
-        "--timeframe", required=False, default="1m", choices=sorted(VALID_TIMEFRAMES), help="Timeframe to sync (1m, 1h, 1D)"
+        "--timeframe", default="1m", choices=sorted(VALID_TIMEFRAMES), help="Timeframe to sync (1m, 1h, 1D)"
     )
-    parser.add_argument("--end", required=False, help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
+    parser.add_argument("--end", help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
     parser.add_argument("--polling", action="store_true", help="Compact one-liner output for live polling")
     parser.add_argument("--verbose", action="store_true", help="Verbose output (debug mode for polling)")
+    # Discovery commands
+    parser.add_argument("--get-exchanges", action="store_true", help="List available exchanges (EODHD only)")
+    parser.add_argument("--get-tickers", metavar="EXCHANGE", help="List available tickers for an exchange (e.g., BITFINEX, US)")
+    parser.add_argument("--format", choices=["table", "json", "simple"], default="table", help="Output format (default: table)")
+    # EODHD-specific commands
+    parser.add_argument("--bulk", metavar="EXCHANGE", help="Bulk sync all tickers on an exchange (EODHD only)")
+    parser.add_argument("--bulk-date", metavar="DATE", help="Date for bulk sync (YYYY-MM-DD, default: latest)")
+    parser.add_argument("--refresh-metadata", action="store_true", help="Force refresh EODHD metadata cache")
     args = parser.parse_args()
+
+    # Handle discovery commands first
+    if args.get_exchanges:
+        try:
+            return _handle_get_exchanges(args.format)
+        except Exception as e:
+            log_error(f"Failed to get exchanges: {e}")
+            return 1
+
+    if args.get_tickers:
+        try:
+            return _handle_get_tickers(args.get_tickers, args.format)
+        except Exception as e:
+            log_error(f"Failed to get tickers: {e}")
+            return 1
+
+    # Handle EODHD-specific commands
+    if args.refresh_metadata:
+        try:
+            return _handle_refresh_metadata()
+        except Exception as e:
+            log_error(f"Failed to refresh metadata: {e}")
+            return 1
+
+    if args.bulk:
+        try:
+            return _handle_bulk_sync(args.bulk, date=args.bulk_date, verbose=args.verbose)
+        except Exception as e:
+            log_error(f"Bulk sync failed: {e}")
+            return 1
+
+    # For sync commands, require exchange and ticker
+    if not args.exchange or not args.ticker:
+        log_error("--exchange and --ticker are required for sync operations.")
+        log_info("Use --get-exchanges or --get-tickers for discovery commands.")
+        return 1
 
     exchange = normalize_exchange(args.exchange)
     target = f"{c_type(exchange)}/{c_var(args.ticker)}/{c_type(args.timeframe)}"
