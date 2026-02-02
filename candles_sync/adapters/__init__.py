@@ -69,6 +69,7 @@ def list_adapters() -> List[str]:
 from . import bitfinex
 from . import binance
 from . import yahoo
+from . import eodhd
 
 __all__ = [
     'ExchangeAdapter',

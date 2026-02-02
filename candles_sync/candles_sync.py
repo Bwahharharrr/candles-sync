@@ -543,6 +543,10 @@ def fetch_candles(
         params["interval"] = exchange_tf
     elif adapter.name == "YAHOO":
         params["interval"] = exchange_tf
+    elif adapter.name == "EODHD":
+        # EODHD needs time params built separately based on timeframe
+        time_params = adapter.build_time_params(start, end, exchange_tf)
+        params.update(time_params)
 
     delay = config.rate_limit.initial_backoff_seconds
     max_delay = config.rate_limit.max_backoff_seconds
@@ -1042,7 +1046,10 @@ def synchronize_candle_data(
         try:
             latest = pd.read_csv(current_csv, usecols=["timestamp"])["timestamp"].astype(int).max()
             if not pd.isna(latest):  # Handle empty CSV files (header only)
-                refresh_start_ms = latest  # inclusive re-fetch
+                # Go back one interval to ensure the latest candle gets re-fetched
+                # This fixes incomplete candles that were saved while still forming
+                interval_ms = _get_interval_ms(timeframe)
+                refresh_start_ms = latest - interval_ms
         except Exception:
             pass
 
