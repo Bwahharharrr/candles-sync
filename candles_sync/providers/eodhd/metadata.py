@@ -52,6 +52,7 @@ class MetadataCache:
         """
         self.cache_dir = cache_dir or CACHE_DIR
         self.ttl_seconds = ttl_seconds
+        self._session = requests.Session()
         self._ensure_cache_dirs()
 
     def _ensure_cache_dirs(self) -> None:
@@ -69,9 +70,14 @@ class MetadataCache:
     def _atomic_write(self, filepath: Path, data: Any) -> None:
         """Write data to file atomically using tmp file + rename."""
         tmp_path = filepath.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        tmp_path.rename(filepath)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            tmp_path.rename(filepath)
+        except BaseException:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
 
     def _read_cache(self, filepath: Path) -> Optional[Any]:
         """Read and parse a cache file."""
@@ -90,7 +96,7 @@ class MetadataCache:
             "api_token": get_api_token(),
             "fmt": "json",
         }
-        resp = requests.get(url, params=params, timeout=30)
+        resp = self._session.get(url, params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()
 
@@ -185,22 +191,21 @@ class MetadataCache:
         """
         Rebuild the index from scratch, optionally for specific exchanges.
 
+        Builds the new index to a temp file first, then atomically replaces
+        the old one to prevent data loss if the process crashes mid-rebuild.
+
         Args:
             exchanges: List of exchange codes to include (default: all cached)
 
         Returns:
             Updated index dict
         """
-        # Clear existing index
-        index_file = self.cache_dir / "index.json"
-        if index_file.exists():
-            index_file.unlink()
-
         if exchanges:
             # Refresh specified exchanges
             for code in exchanges:
                 self.get_exchange_symbols(code, force_refresh=True)
 
+        # Build the new index in-memory, then write atomically
         return self.get_index(force_refresh=True)
 
     def refresh_all(self, exchanges: Optional[List[str]] = None) -> None:

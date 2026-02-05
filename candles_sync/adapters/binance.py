@@ -4,6 +4,7 @@ Binance exchange adapter.
 API Documentation: https://binance-docs.github.io/apidocs/spot/en/#kline-candlestick-data
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -29,11 +30,13 @@ class BinanceAdapter(ExchangeAdapter):
     ]
     """
 
-    @property
-    def name(self) -> str:
-        return "BINANCE"
+    ADAPTER_NAME = "BINANCE"
 
     @property
+    def name(self) -> str:
+        return self.ADAPTER_NAME
+
+    @functools.cached_property
     def config(self) -> AdapterConfig:
         return AdapterConfig(
             api_url=BINANCE_API_URL,
@@ -94,6 +97,19 @@ class BinanceAdapter(ExchangeAdapter):
             params['limit'] = min(int(limit), API_LIMIT)
         else:
             params['limit'] = API_LIMIT
+        return params
+
+    def build_fetch_params(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: int,
+        end: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        params = self.build_params(start, end, limit)
+        params["symbol"] = symbol
+        params["interval"] = timeframe
         return params
 
     def parse_response(self, data: Any) -> List[Candle]:

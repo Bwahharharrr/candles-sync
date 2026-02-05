@@ -9,6 +9,7 @@ Note: Yahoo Finance has data availability limits by timeframe:
 - 1d: Full history available
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -48,11 +49,13 @@ class YahooAdapter(ExchangeAdapter):
     Note: Yahoo uses Unix seconds, not milliseconds.
     """
 
-    @property
-    def name(self) -> str:
-        return "YAHOO"
+    ADAPTER_NAME = "YAHOO"
 
     @property
+    def name(self) -> str:
+        return self.ADAPTER_NAME
+
+    @functools.cached_property
     def config(self) -> AdapterConfig:
         return AdapterConfig(
             api_url=YAHOO_API_URL,
@@ -123,6 +126,18 @@ class YahooAdapter(ExchangeAdapter):
 
         return params
 
+    def build_fetch_params(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: int,
+        end: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        params = self.build_params(start, end, limit)
+        params["interval"] = timeframe
+        return params
+
     def parse_response(self, data: Any) -> List[Candle]:
         """
         Parse Yahoo Finance API response into Candle objects.
@@ -169,7 +184,7 @@ class YahooAdapter(ExchangeAdapter):
                 c = closes[i] if i < len(closes) else None
                 v = volumes[i] if i < len(volumes) else None
 
-                if None in (ts, o, h, l, c):
+                if None in (ts, o, h, l, c, v):
                     continue
 
                 candle = Candle(
@@ -178,7 +193,7 @@ class YahooAdapter(ExchangeAdapter):
                     high=float(h),
                     low=float(l),
                     close=float(c),
-                    volume=float(v) if v is not None else 0.0,
+                    volume=float(v),
                 )
                 candles.append(candle)
             except (ValueError, TypeError, IndexError):

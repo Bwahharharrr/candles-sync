@@ -49,6 +49,7 @@ class BitfinexMetadataCache:
         """
         self.cache_dir = cache_dir or CACHE_DIR
         self.ttl_seconds = ttl_seconds
+        self._session = requests.Session()
         self._ensure_cache_dirs()
 
     def _ensure_cache_dirs(self) -> None:
@@ -65,9 +66,14 @@ class BitfinexMetadataCache:
     def _atomic_write(self, filepath: Path, data: Any) -> None:
         """Write data to file atomically using tmp file + rename."""
         tmp_path = filepath.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        tmp_path.rename(filepath)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            tmp_path.rename(filepath)
+        except BaseException:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
 
     def _read_cache(self, filepath: Path) -> Optional[Dict[str, Any]]:
         """Read and parse a cache file."""
@@ -81,7 +87,7 @@ class BitfinexMetadataCache:
 
     def _fetch_from_api(self) -> List[str]:
         """Fetch trading pairs from Bitfinex API."""
-        resp = requests.get(BITFINEX_PAIRS_URL, timeout=30)
+        resp = self._session.get(BITFINEX_PAIRS_URL, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         # API returns double-nested array: [["BTCUSD", "ETHUSD", ...]]

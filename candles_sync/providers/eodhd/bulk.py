@@ -14,21 +14,11 @@ import requests
 
 from candles_sync.adapters.eodhd import get_api_token, EODHD_API_URL
 from candles_sync.adapters.base import Candle
+from candles_sync.candles_sync import CSV_COLUMNS, _canonical_num_str
 
 
 # Default data directory
 DATA_DIR = Path.home() / ".corky" / "EODHD" / "candles"
-
-# CSV column order (matches existing candles_sync pattern)
-CSV_COLUMNS = ["timestamp", "open", "close", "high", "low", "volume"]
-
-
-def _canonical_num_str(val: float) -> str:
-    """Convert a number to canonical string representation."""
-    if val == int(val):
-        return str(int(val))
-    s = f"{val:.10f}".rstrip("0").rstrip(".")
-    return s
 
 
 def _candle_to_csv_row(candle: Candle) -> str:
@@ -46,6 +36,7 @@ def _candle_to_csv_row(candle: Candle) -> str:
 def _fetch_bulk_data(
     exchange_code: str,
     date: Optional[str] = None,
+    session: Optional[requests.Session] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch bulk EOD data for an exchange.
@@ -53,6 +44,7 @@ def _fetch_bulk_data(
     Args:
         exchange_code: Exchange code (e.g., 'US', 'LSE')
         date: Optional date in YYYY-MM-DD format (default: latest)
+        session: Optional requests.Session for connection reuse
 
     Returns:
         List of candle dicts from the API
@@ -65,7 +57,8 @@ def _fetch_bulk_data(
     if date:
         params["date"] = date
 
-    resp = requests.get(url, params=params, timeout=60)
+    http = session or requests
+    resp = http.get(url, params=params, timeout=60)
     resp.raise_for_status()
     return resp.json()
 
@@ -134,26 +127,11 @@ def _ensure_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _read_existing_timestamps(filepath: Path) -> set:
-    """Read existing timestamps from a CSV file."""
-    timestamps = set()
-    if not filepath.exists():
-        return timestamps
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("timestamp"):
-                try:
-                    ts = int(line.split(",")[0])
-                    timestamps.add(ts)
-                except (ValueError, IndexError):
-                    continue
-    return timestamps
-
-
 def _append_to_csv(filepath: Path, candles: List[Candle]) -> int:
     """
-    Append candles to a CSV file, skipping duplicates.
+    Append candles to a CSV file, skipping duplicates and ensuring sorted output.
+
+    Reads the file once to extract both timestamps (for dedup) and rows (for merge).
 
     Args:
         filepath: Path to the CSV file
@@ -163,23 +141,40 @@ def _append_to_csv(filepath: Path, candles: List[Candle]) -> int:
         Number of candles actually written
     """
     _ensure_dir(filepath)
-    existing_ts = _read_existing_timestamps(filepath)
 
-    # Filter out duplicates and sort by timestamp
+    # Single-pass read: extract both timestamps and rows
+    existing_ts: set = set()
+    existing_rows: List[str] = []
+    if filepath.exists() and filepath.stat().st_size > 0:
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("timestamp"):
+                    existing_rows.append(line)
+                    try:
+                        ts = int(line.split(",")[0])
+                        existing_ts.add(ts)
+                    except (ValueError, IndexError):
+                        continue
+
+    # Filter out duplicates
     new_candles = [c for c in candles if c.timestamp not in existing_ts]
-    new_candles.sort(key=lambda c: c.timestamp)
 
     if not new_candles:
         return 0
 
-    # Check if file needs header
-    needs_header = not filepath.exists() or filepath.stat().st_size == 0
+    new_rows = [_candle_to_csv_row(c) for c in new_candles]
+    all_rows = existing_rows + new_rows
 
-    with open(filepath, "a") as f:
-        if needs_header:
-            f.write(",".join(CSV_COLUMNS) + "\n")
-        for candle in new_candles:
-            f.write(_candle_to_csv_row(candle) + "\n")
+    # Sort by timestamp (first field)
+    all_rows.sort(key=lambda row: int(row.split(",")[0]))
+
+    tmp_path = filepath.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
+        f.write(",".join(CSV_COLUMNS) + "\n")
+        for row in all_rows:
+            f.write(row + "\n")
+    os.replace(str(tmp_path), str(filepath))
 
     return len(new_candles)
 
@@ -211,9 +206,12 @@ def bulk_sync_exchange(
     if verbose:
         print(f"Fetching bulk data for {exchange_code}...")
 
+    # Use a session for connection pooling
+    session = requests.Session()
+
     # Fetch bulk data
     try:
-        raw_data = _fetch_bulk_data(exchange_code, date)
+        raw_data = _fetch_bulk_data(exchange_code, date, session=session)
     except Exception as e:
         print(f"Error fetching bulk data: {e}")
         return {}
@@ -260,7 +258,7 @@ def bulk_sync_exchange(
                 written_count += 1
                 if verbose:
                     print(f"  {symbol}: wrote {total_written} candle(s)")
-        except Exception as e:
+        except (OSError, KeyError, ValueError, requests.RequestException) as e:
             results[symbol] = False
             error_count += 1
             if verbose:

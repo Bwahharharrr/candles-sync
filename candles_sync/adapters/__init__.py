@@ -25,10 +25,12 @@ def register_adapter(cls: Type[ExchangeAdapter]) -> Type[ExchangeAdapter]:
         class MyAdapter(ExchangeAdapter):
             ...
     """
-    # Instantiate temporarily to get the name
-    instance = cls()
-    name = instance.name.upper()
-    _ADAPTERS[name] = cls
+    # Use ADAPTER_NAME class attribute if available, otherwise fall back to instantiation
+    name = getattr(cls, 'ADAPTER_NAME', None)
+    if name is None:
+        instance = cls()
+        name = instance.name
+    _ADAPTERS[name.upper()] = cls
     return cls
 
 

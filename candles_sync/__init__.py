@@ -8,6 +8,3 @@ __all__ = [
     "list_adapters",
     "ExchangeAdapter",
 ]
-
-if __name__ == "__main__":
-    main()

@@ -98,8 +98,19 @@ DATE_FMT_YEAR = "%Y"
 
 INTERVAL_MS = {"1m": 60_000, "1h": 3_600_000, "1D": 86_400_000}
 
+# Number of decimal places for canonical numeric formatting.
+# 10 covers typical financial asset precision while keeping file sizes modest.
+CANONICAL_DECIMAL_PLACES = 10
+
 # Progress bar threshold - show progress when scanning more than this many files
 PROGRESS_THRESHOLD = 100
+
+# Maximum number of retries for API requests before giving up
+MAX_FETCH_RETRIES = 10
+
+# Maximum number of synthetic rows to generate for a single gap.
+# Gaps exceeding this are likely data errors, not real trading gaps.
+MAX_GAP_SYNTHESIS_ROWS = 50_000
 
 # ------------------------------ Logging helpers --------------------------- #
 
@@ -171,27 +182,17 @@ def _fmt_ts_utc(ms: int) -> str:
     try:
         dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception:
+    except (ValueError, TypeError, OSError):
         return "N/A"
 
 def _fmt_mts_map(ms: int) -> str:
     """Format 'milliseconds -> human time' with coloring."""
     return f"{c_var(int(ms))} → {c_ts(_fmt_ts_utc(int(ms)))}"
 
-def _fmt_ohlcv_inline(row: List[float]) -> str:
-    """
-    Bitfinex order: [mts, open, close, high, low, volume]
-    Return compact inline OHLCV with canonicalized numbers.
-    """
-    try:
-        o = _canonical_num_str(row[1])
-        c = _canonical_num_str(row[2])
-        h = _canonical_num_str(row[3])
-        l = _canonical_num_str(row[4])
-        v = _canonical_num_str(row[5])
-        return c_desc(f"O:{o} C:{c} H:{h} L:{l} V:{v}")
-    except Exception:
-        return c_desc("O:?-C:? H:? L:? V:?")
+def _redact_url(url: str) -> str:
+    """Redact sensitive query parameters (like api_token) from URLs for logging."""
+    import re
+    return re.sub(r'(api_token=)[^&]+', r'\1***', url)
 
 # ------------------------------ Utilities --------------------------------- #
 
@@ -288,7 +289,7 @@ class Partition:
         dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
         start = Partition._align_start(tf, dt)
         next_start = Partition._next_start(tf, start)
-        end = next_start - timedelta(seconds=1)
+        end = next_start - timedelta(milliseconds=1)
         name = (
             start.strftime(DATE_FMT_DAY) if tf == "1m"
             else start.strftime(DATE_FMT_MONTH) if tf == "1h"
@@ -306,7 +307,7 @@ class Partition:
         else:
             start = datetime.strptime(name, DATE_FMT_YEAR).replace(month=1, day=1, tzinfo=timezone.utc)
         next_start = Partition._next_start(tf, start)
-        end = next_start - timedelta(seconds=1)
+        end = next_start - timedelta(milliseconds=1)
         return Partition(tf, name, start, end)
 
     @staticmethod
@@ -321,19 +322,20 @@ class Partition:
         return out
 
     def next(self) -> "Partition":
-        return Partition.from_timestamp(self.timeframe, int((self.end + timedelta(seconds=1)).timestamp() * 1000))
+        return Partition.from_timestamp(self.timeframe, int((self.end + timedelta(milliseconds=1)).timestamp() * 1000))
 
 # ------------------------------ Canonical numbers ------------------------- #
 
 def _to_decimal(value) -> decimal.Decimal:
     try:
         return decimal.Decimal(str(value))
-    except Exception:
+    except (ValueError, decimal.InvalidOperation, TypeError):
+        log_warn(f"Invalid numeric value {value!r}, defaulting to 0")
         return decimal.Decimal(0)
 
 def _canonical_num_str(x: object) -> str:
-    # 10dp is plenty for Bitfinex spot candles yet keeps size modest.
-    s = f"{decimal.Decimal(str(x)):.10f}"
+    d = _to_decimal(x)
+    s = f"{d:.{CANONICAL_DECIMAL_PLACES}f}"
     s = s.rstrip("0").rstrip(".")
     return s if s else "0"
 
@@ -372,18 +374,40 @@ def write_partition(df: pd.DataFrame, path: str) -> int:
     for col in ["open", "close", "high", "low", "volume"]:
         merged[col] = merged[col].apply(_canonical_num_str)
 
-    merged.to_csv(path, index=False)
+    tmp_path = path + ".tmp"
+    merged.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)
     return int(len(merged) - len(old))
 
 def _read_last_timestamp_from_file(path: str) -> Optional[int]:
     """Read the last timestamp from a single CSV file. Returns None if file is empty/invalid."""
     try:
-        size = os.path.getsize(path)
-        if size <= 50:  # header-only or empty
-            return None
-        ts_col = pd.read_csv(path, usecols=["timestamp"]).iloc[-1, 0]
-        return int(float(ts_col))
-    except Exception:
+        # Read header to check if file has data beyond the header row
+        with open(path, "r") as f:
+            header = f.readline().strip()
+            if not header:
+                return None
+            second_line = f.readline().strip()
+            if not second_line:
+                return None  # header-only file
+        # Seek to end and read last line for O(1) performance
+        with open(path, "rb") as f:
+            f.seek(0, 2)  # seek to end
+            file_size = f.tell()
+            if file_size == 0:
+                return None
+            # Read up to 256 bytes from end to find last newline
+            read_size = min(256, file_size)
+            f.seek(-read_size, 2)
+            chunk = f.read(read_size).decode("utf-8", errors="replace")
+            lines = chunk.strip().split("\n")
+            last_line = lines[-1].strip()
+            if not last_line or last_line.startswith("timestamp"):
+                return None
+            ts_str = last_line.split(",")[0]
+            return int(float(ts_str))
+    except (OSError, ValueError, IndexError) as e:
+        log_warn(f"Could not read timestamp from {path}: {e}")
         return None
 
 def last_timestamp_in_dir(dir_path: str, *, debug: bool = False, full_scan: bool = False) -> Optional[int]:
@@ -429,11 +453,11 @@ def last_timestamp_in_dir(dir_path: str, *, debug: bool = False, full_scan: bool
         return None
     
     # Full scan path (with progress bar for large directories)
-    timestamps: List[int] = []
-    
+    result: Optional[int] = None
+
     # Determine if we should show a progress bar
     show_progress = TQDM_AVAILABLE and len(csv_files) >= PROGRESS_THRESHOLD and not debug
-    
+
     if show_progress:
         iterator = tqdm(
             csv_files,
@@ -444,19 +468,18 @@ def last_timestamp_in_dir(dir_path: str, *, debug: bool = False, full_scan: bool
         )
     else:
         iterator = csv_files
-    
+
     for f in iterator:
         full = os.path.join(dir_path, f)
         ts = _read_last_timestamp_from_file(full)
         if ts is not None:
-            timestamps.append(ts)
+            if result is None or ts > result:
+                result = ts
             if debug and f == csv_files[-1]:
                 log_trace(f"  {c_file(f)}: last_ts={c_ts(ts)} ({_fmt_ts_utc(ts)})")
         elif debug:
             size = os.path.getsize(full) if os.path.exists(full) else 0
             log_trace(f"  {c_file(f)}: skipped (size={size} or read error)")
-    
-    result = max(timestamps) if timestamps else None
     if debug:
         if result:
             log_trace(f"  Result: {c_ts(result)} ({_fmt_ts_utc(result)})")
@@ -468,7 +491,15 @@ def _group_consecutive(tf: str, names: List[str]) -> List[List[str]]:
     """Group partition names into consecutive runs (per timeframe)."""
     if not names:
         return []
-    parts = [Partition.from_name(tf, n) for n in names]
+    parts = []
+    for n in names:
+        try:
+            parts.append(Partition.from_name(tf, n))
+        except (ValueError, KeyError) as e:
+            log_warn(f"Skipping malformed partition name '{n}': {e}")
+            continue
+    if not parts:
+        return []
     parts.sort(key=lambda p: p.start)
     groups: List[List[str]] = [[parts[0].name]]
     prev = parts[0]
@@ -535,38 +566,32 @@ def fetch_candles(
     config = adapter.config
     exchange_tf = adapter.translate_timeframe(timeframe)
     url = adapter.build_url(symbol, exchange_tf)
-    params = adapter.build_params(start, end, limit)
-
-    # For adapters that need symbol/interval in params (like Binance)
-    if adapter.name == "BINANCE":
-        params["symbol"] = symbol
-        params["interval"] = exchange_tf
-    elif adapter.name == "YAHOO":
-        params["interval"] = exchange_tf
-    elif adapter.name == "EODHD":
-        # EODHD needs time params built separately based on timeframe
-        time_params = adapter.build_time_params(start, end, exchange_tf)
-        params.update(time_params)
+    params = adapter.build_fetch_params(symbol, exchange_tf, start, end, limit)
 
     delay = config.rate_limit.initial_backoff_seconds
     max_delay = config.rate_limit.max_backoff_seconds
+    retries = 0
+    full = f"{url}?{urlencode(params)}"
 
     while True:
-        full = f"{url}?{urlencode(params)}"
         if polling:
             now_utc = datetime.now(timezone.utc)
             if debug:
                 poll_print(f"Now: {c_ts(now_utc.strftime('%Y-%m-%d %H:%M:%S'))} -- {c_var(int(now_utc.timestamp()*1000))}")
-                poll_print(f"Fetching: {c_var(full)}")
+                poll_print(f"Fetching: {c_var(_redact_url(full))}")
             t0 = time.perf_counter()
         else:
-            log_info(f"GET {c_var(full)}")
+            log_info(f"GET {c_var(_redact_url(full))}")
 
         try:
             resp = requests.get(full, headers=HEADERS, timeout=config.timeout_seconds)
         except Exception as e:
+            retries += 1
+            if retries > MAX_FETCH_RETRIES:
+                log_error(f"Network error after {MAX_FETCH_RETRIES} retries: {c_desc(e)}. Giving up.")
+                return []
             if not polling:
-                log_error(f"Network error: {c_desc(e)}. Retrying in {c_var(f'{delay}s')}...")
+                log_error(f"Network error: {c_desc(e)}. Retrying in {c_var(f'{delay}s')} ({retries}/{MAX_FETCH_RETRIES})...")
             time.sleep(delay)
             delay = min(max_delay, delay * 2)
             continue
@@ -631,13 +656,17 @@ def fetch_candles(
                 first_h = datetime.fromtimestamp(candles[0].timestamp / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 last_h = datetime.fromtimestamp(candles[-1].timestamp / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 log_success(f"Received {c_rows(len(candles))} candles ({c_ts(first_h)} → {c_ts(last_h)})")
-            except Exception:
+            except (ValueError, TypeError, OSError):
                 log_success(f"Received {c_rows(len(candles))} candles")
             return candles
 
         if adapter.is_rate_limited(resp.status_code):
+            retries += 1
+            if retries > MAX_FETCH_RETRIES:
+                log_error(f"Rate limit ({resp.status_code}) after {MAX_FETCH_RETRIES} retries. Giving up.")
+                return []
             if not polling:
-                log_warn(f"Rate limit ({resp.status_code}). Retrying in {c_var(f'{delay}s')}...")
+                log_warn(f"Rate limit ({resp.status_code}). Retrying in {c_var(f'{delay}s')} ({retries}/{MAX_FETCH_RETRIES})...")
             time.sleep(delay)
             delay = min(max_delay, delay * 2)
             continue
@@ -736,7 +765,9 @@ def _audit_api_chunk_fill_internal_gaps(
         for c in candles
     ]
     df = pd.DataFrame(rows, columns=CSV_COLUMNS)
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").dropna().astype("int64")
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df["timestamp"] = df["timestamp"].astype("int64")
     df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
 
     if len(df) < 2:
@@ -755,14 +786,22 @@ def _audit_api_chunk_fill_internal_gaps(
         gap = next_ts - prev_ts
         if gap <= interval:
             continue
+        num_missing = (gap // interval) - 1
+        if num_missing > MAX_GAP_SYNTHESIS_ROWS:
+            log_error(
+                f"Gap of {num_missing} intervals between "
+                f"{prev_ts} and {next_ts} exceeds MAX_GAP_SYNTHESIS_ROWS "
+                f"({MAX_GAP_SYNTHESIS_ROWS}). Skipping synthesis for this gap."
+            )
+            continue
         expected_ts = list(range(prev_ts + interval, next_ts, interval))
         prev_close_val = df.iloc[i]["close"]
         inserts.append(_synthesize_gap_rows(expected_ts, prev_close_val))
 
     if inserts:
-        add_df = pd.concat(inserts, ignore_index=True) if inserts else pd.DataFrame(columns=CSV_COLUMNS)
+        add_df = pd.concat(inserts, ignore_index=True)
         merged = pd.concat([df[CSV_COLUMNS], add_df], ignore_index=True)
-        merged["timestamp"] = pd.to_numeric(merged["timestamp"], errors="coerce").astype("Int64").dropna().astype("int64")
+        merged["timestamp"] = merged["timestamp"].astype("int64")
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
         df = merged
 
@@ -887,6 +926,10 @@ def synchronize_candle_data(
     # Get the adapter for this exchange
     adapter = get_adapter(exchange)
 
+    # Validate adapter-specific configuration early (e.g., API tokens)
+    if hasattr(adapter, 'validate_config'):
+        adapter.validate_config()
+
     # Format symbol using the adapter
     symbol = adapter.format_symbol(ticker)
 
@@ -907,71 +950,92 @@ def synchronize_candle_data(
         end_dt = datetime.now(timezone.utc)
     end_ms = int(end_dt.timestamp() * 1000)
 
-    # --------------------------------------------------------------
-    # 1. FIRST-TIME SYNC: discover real start and fetch everything
-    # --------------------------------------------------------------
     has_csvs = any(f.endswith(".csv") for f in os.listdir(dir_path))
     if not os.path.exists(gotstart) or not has_csvs:
-        if os.path.exists(gotstart) and not has_csvs:
-            if not polling:
-                log_warn(f"{GOTSTART_FILE} exists but no data files — recovering with full sync")
-            os.remove(gotstart)
-        else:
-            if not polling:
-                log_warn("First-time sync — discovering genesis candle...")
-
-        genesis_ms = find_genesis_timestamp(adapter, symbol, timeframe, polling=polling, debug=debug)
-        if not polling:
-            genesis_dt = datetime.fromtimestamp(genesis_ms / 1000, tz=timezone.utc)
-            log_info(f"Genesis candle: {c_ts(genesis_dt.strftime('%Y-%m-%d %H:%M UTC'))} — starting full sync")
-
-        # Only create .gotstart after writing at least one complete partition
-        original_write = write_partition
-
-        def safe_write_partition(df: pd.DataFrame, path: str) -> int:
-            result = original_write(df, path)
-            part_name = Path(path).stem
-
-            # Create .gotstart once a "complete enough" partition is written
-            if not os.path.exists(gotstart):
-                create_marker = False
-                if timeframe == "1h" and part_name >= "2013-04":    # first full month after genesis
-                    create_marker = True
-                elif timeframe == "1m" and part_name >= "2013-04-01":
-                    create_marker = True
-                elif timeframe == "1D" and part_name >= "2014":
-                    create_marker = True
-
-                if create_marker:
-                    Path(gotstart).touch()
-                    if not polling:
-                        log_info(f"First complete partition written ({c_file(part_name)}) → created {GOTSTART_FILE}")
-            return result
-
-        # Pass genesis_ms as the floor to prevent empty partitions before data exists
-        _fetch_and_save_range(
-            adapter, symbol, timeframe, dir_path, genesis_ms, end_ms,
-            polling=polling, debug=debug, write_fn=safe_write_partition,
-            genesis_floor_ms=genesis_ms
+        return _first_time_sync(
+            adapter, symbol, timeframe, dir_path, gotstart, end_ms,
+            has_csvs=has_csvs, polling=polling, debug=debug,
         )
 
-        # Final fallback: if somehow never triggered, create anyway
-        if not os.path.exists(gotstart):
+    return _incremental_sync(
+        adapter, symbol, timeframe, dir_path, end_dt, end_ms,
+        verbose=verbose, polling=polling, debug=debug,
+    )
+
+
+def _first_time_sync(
+    adapter: ExchangeAdapter,
+    symbol: str,
+    timeframe: str,
+    dir_path: str,
+    gotstart: str,
+    end_ms: int,
+    *,
+    has_csvs: bool,
+    polling: bool = False,
+    debug: bool = False,
+) -> bool:
+    """Discover genesis candle and fetch full history."""
+    if os.path.exists(gotstart) and not has_csvs:
+        if not polling:
+            log_warn(f"{GOTSTART_FILE} exists but no data files — recovering with full sync")
+        os.remove(gotstart)
+    else:
+        if not polling:
+            log_warn("First-time sync — discovering genesis candle...")
+
+    genesis_ms = find_genesis_timestamp(adapter, symbol, timeframe, polling=polling, debug=debug)
+    if not polling:
+        genesis_dt = datetime.fromtimestamp(genesis_ms / 1000, tz=timezone.utc)
+        log_info(f"Genesis candle: {c_ts(genesis_dt.strftime('%Y-%m-%d %H:%M UTC'))} — starting full sync")
+
+    original_write = write_partition
+
+    def safe_write_partition(df: pd.DataFrame, path: str) -> int:
+        result = original_write(df, path)
+        part_name = Path(path).stem
+
+        # Create .gotstart after the first non-empty partition write
+        if not os.path.exists(gotstart) and result > 0:
             Path(gotstart).touch()
             if not polling:
-                log_info(f"Full sync completed → created {GOTSTART_FILE}")
+                log_info(f"First partition written ({c_file(part_name)}) → created {GOTSTART_FILE}")
+        return result
 
+    _fetch_and_save_range(
+        adapter, symbol, timeframe, dir_path, genesis_ms, end_ms,
+        polling=polling, debug=debug, write_fn=safe_write_partition,
+        genesis_floor_ms=genesis_ms
+    )
+
+    # Belt-and-suspenders fallback: if safe_write_partition never ran
+    # (e.g., API returned only empty partitions), create marker anyway
+    if not os.path.exists(gotstart):
+        Path(gotstart).touch()
         if not polling:
-            log_success("First-time sync finished successfully")
-        return True
+            log_info(f"Full sync completed → created {GOTSTART_FILE}")
 
-    # --------------------------------------------------------------
-    # 2. INCREMENTAL SYNC: only run if .gotstart exists
-    # --------------------------------------------------------------
+    if not polling:
+        log_success("First-time sync finished successfully")
+    return True
+
+
+def _incremental_sync(
+    adapter: ExchangeAdapter,
+    symbol: str,
+    timeframe: str,
+    dir_path: str,
+    end_dt: datetime,
+    end_ms: int,
+    *,
+    verbose: bool = False,
+    polling: bool = False,
+    debug: bool = False,
+) -> bool:
+    """Fill missing partitions and refresh the current one."""
     if not polling:
         log_info("Incremental sync — checking for gaps and refreshing current partition")
 
-    # Determine real historical start from existing files
     existing_files = [f for f in os.listdir(dir_path) if f.endswith(".csv")]
     existing = {f[:-4] for f in existing_files}
 
@@ -979,13 +1043,11 @@ def synchronize_candle_data(
         earliest_name = min(existing_files)[:-4]
         real_start_dt = Partition.from_name(timeframe, earliest_name).start
     else:
-        # This should never happen — .gotstart exists → files should exist
         real_start_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     needed = {p.name for p in Partition.all_between(timeframe, real_start_dt, end_dt)}
     missing = sorted(needed - existing, key=lambda n: Partition.from_name(timeframe, n).start)
 
-    # DEBUG: show what we computed
     if verbose and not polling:
         log_trace(f"existing files: {c_rows(len(existing_files))}, needed partitions: {c_rows(len(needed))}, missing: {c_rows(len(missing))}")
         if missing:
@@ -993,36 +1055,41 @@ def synchronize_candle_data(
 
     last_ts = last_timestamp_in_dir(dir_path, debug=verbose) or 0
 
-    # DEBUG: show last_ts
     if verbose and not polling:
         if last_ts:
             log_trace(f"last_ts from dir: {c_ts(last_ts)} ({_fmt_ts_utc(last_ts)})")
         else:
             log_trace(f"last_ts from dir: {c_rows('0 (None returned)')}")
 
-    # For incremental sync, use the earliest existing file's start as the genesis floor
     genesis_floor_ms = int(real_start_dt.timestamp() * 1000) if existing_files else None
 
-    # Fill missing historical gaps
+    def _tracking_write(df: pd.DataFrame, path: str) -> int:
+        """Write partition and track the latest timestamp in-memory."""
+        delta = write_partition(df, path)
+        ts_col = pd.to_numeric(df["timestamp"], errors="coerce").dropna()
+        if not ts_col.empty:
+            written_max = int(ts_col.max())
+            if written_max > last_ts_holder[0]:
+                last_ts_holder[0] = written_max
+        return delta
+
+    last_ts_holder = [last_ts]  # mutable container for closure
+
     for group in _group_consecutive(timeframe, missing):
         first = Partition.from_name(timeframe, group[0])
         last = Partition.from_name(timeframe, group[-1])
 
-        # Calculate start_ms: use last_ts + 1 if we have valid data, otherwise partition start
         first_start_ms = int(first.start.timestamp() * 1000)
-        if last_ts > 0:
-            # We have existing data - start from where we left off
-            start_ms = min(last_ts + 1, first_start_ms)
+        if last_ts_holder[0] > 0:
+            start_ms = min(last_ts_holder[0] + 1, first_start_ms)
         else:
-            # No valid last_ts (shouldn't happen in incremental sync) - start from partition
             start_ms = first_start_ms
 
         group_end_ms = min(int(last.end.timestamp() * 1000), end_ms)
 
-        # DEBUG: show computation
         if verbose and not polling:
             log_trace(f"Gap fill computation:")
-            log_trace(f"  last_ts = {c_var(last_ts)} ({_fmt_ts_utc(last_ts) if last_ts else 'N/A'})")
+            log_trace(f"  last_ts = {c_var(last_ts_holder[0])} ({_fmt_ts_utc(last_ts_holder[0]) if last_ts_holder[0] else 'N/A'})")
             log_trace(f"  first.start = {c_ts(first_start_ms)} ({first.start})")
             log_trace(f"  => start_ms = {c_var(start_ms)} ({_fmt_ts_utc(start_ms)})")
 
@@ -1032,9 +1099,10 @@ def synchronize_candle_data(
             log_info(f"Filling gap: {c_file(first.name)} → {c_file(last.name)} ({c_rows(len(group))} partitions)")
         _fetch_and_save_range(
             adapter, symbol, timeframe, dir_path, start_ms, group_end_ms,
-            polling=polling, debug=debug, genesis_floor_ms=genesis_floor_ms
+            polling=polling, debug=debug, genesis_floor_ms=genesis_floor_ms,
+            write_fn=_tracking_write,
         )
-        last_ts = last_timestamp_in_dir(dir_path) or last_ts
+    last_ts = last_ts_holder[0]
 
     # Always refresh current partition
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -1045,13 +1113,11 @@ def synchronize_candle_data(
     if os.path.exists(current_csv):
         try:
             latest = pd.read_csv(current_csv, usecols=["timestamp"])["timestamp"].astype(int).max()
-            if not pd.isna(latest):  # Handle empty CSV files (header only)
-                # Go back one interval to ensure the latest candle gets re-fetched
-                # This fixes incomplete candles that were saved while still forming
+            if not pd.isna(latest):
                 interval_ms = _get_interval_ms(timeframe)
                 refresh_start_ms = latest - interval_ms
-        except Exception:
-            pass
+        except (OSError, ValueError, KeyError, pd.errors.EmptyDataError):
+            log_warn(f"Could not read timestamp from {c_file(current_csv)}, using partition start")
 
     if not polling:
         if refresh_start_ms == int(current_partition.start.timestamp() * 1000):
@@ -1078,8 +1144,7 @@ def synchronize_candle_data(
 def _format_exchanges(exchanges: list, fmt: str) -> str:
     """Format exchange list for output."""
     if fmt == "json":
-        import json as _json
-        return _json.dumps({"source": "EODHD", "count": len(exchanges), "exchanges": exchanges}, indent=2)
+        return json.dumps({"source": "EODHD", "count": len(exchanges), "exchanges": exchanges}, indent=2)
     if fmt == "simple":
         return "\n".join(e.get("Code", "") for e in exchanges)
     # Table format
@@ -1094,8 +1159,7 @@ def _format_exchanges(exchanges: list, fmt: str) -> str:
 def _format_tickers(tickers: list, exchange: str, fmt: str) -> str:
     """Format ticker list for output."""
     if fmt == "json":
-        import json as _json
-        return _json.dumps({"exchange": exchange, "count": len(tickers), "tickers": tickers}, indent=2)
+        return json.dumps({"exchange": exchange, "count": len(tickers), "tickers": tickers}, indent=2)
 
     # For Bitfinex, tickers have 'symbol' key; for EODHD, they have 'Code' key
     if tickers and "symbol" in tickers[0]:

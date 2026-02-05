@@ -8,6 +8,7 @@ Supports:
 - Intraday candles: 1m (120 days), 1h (7200 days)
 """
 
+import functools
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -29,6 +30,10 @@ INTRADAY_LIMITS = {
     "1h": 7200,
 }
 
+# Earliest date for EOD data queries. EODHD has limited data before this date
+# for most exchanges.
+EODHD_EARLIEST_EOD_DATE = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
 
 def get_api_token() -> str:
     """Get EODHD API token from environment variable."""
@@ -49,11 +54,17 @@ class EODHDAdapter(ExchangeAdapter):
     Symbol format: SYMBOL.EXCHANGE (e.g., MCD.US, AAPL.US, TSLA.US)
     """
 
-    @property
-    def name(self) -> str:
-        return "EODHD"
+    ADAPTER_NAME = "EODHD"
 
     @property
+    def name(self) -> str:
+        return self.ADAPTER_NAME
+
+    def validate_config(self) -> None:
+        """Validate that EODHD configuration is complete. Call before starting sync."""
+        get_api_token()  # raises ValueError if not set
+
+    @functools.cached_property
     def config(self) -> AdapterConfig:
         return AdapterConfig(
             api_url=EODHD_API_URL,
@@ -86,10 +97,18 @@ class EODHDAdapter(ExchangeAdapter):
         EODHD requires symbols like 'MCD.US', 'AAPL.US', etc.
         If no exchange suffix provided, user should resolve it separately
         using resolve_symbol() or the EODHDResolver class.
+
+        Raises:
+            ValueError: If symbol is missing the required .EXCHANGE suffix.
         """
-        # Symbol should already be in SYMBOL.EXCHANGE format
-        # Just normalize to uppercase
-        return symbol.upper()
+        formatted = symbol.upper()
+        if "." not in formatted:
+            raise ValueError(
+                f"EODHD symbol must be in SYMBOL.EXCHANGE format (e.g., 'AAPL.US'), "
+                f"got '{symbol}'. Use --get-tickers or resolve_symbol() to find the "
+                f"correct format."
+            )
+        return formatted
 
     def resolve_symbol(
         self,
@@ -154,6 +173,19 @@ class EODHDAdapter(ExchangeAdapter):
             "api_token": get_api_token(),
             "fmt": "json",
         }
+
+    def build_fetch_params(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: int,
+        end: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        params = self.build_params(start, end, limit)
+        time_params = self.build_time_params(start, end, timeframe)
+        params.update(time_params)
+        return params
 
     def build_time_params(
         self,
@@ -245,7 +277,7 @@ class EODHDAdapter(ExchangeAdapter):
         symbol: str,
         timeframe: str,
         fetch_fn: Callable[[int, int], List[Candle]],
-    ) -> Optional[int]:
+    ) -> int:
         """
         Find the earliest available timestamp for a symbol.
 
@@ -254,30 +286,31 @@ class EODHDAdapter(ExchangeAdapter):
         - 1h: 7200 days back
 
         For EOD, searches back to year 2000.
+
+        Returns:
+            Timestamp in milliseconds of the earliest candle, or current time
+            if no data is found.
         """
         import time
 
         now_ms = int(time.time() * 1000)
 
         if self._is_intraday(timeframe):
-            # Use the known intraday limits
             max_days = INTRADAY_LIMITS.get(timeframe, 120)
             max_history_ms = max_days * 24 * 60 * 60 * 1000
             earliest_possible = now_ms - max_history_ms
 
-            # Try to fetch from the earliest possible point
             candles = fetch_fn(earliest_possible, now_ms)
             if candles:
                 return candles[0].timestamp
-            return None
+            # No data yet — start from beginning of queryable window so sync
+            # will pick up candles as they become available.
+            return earliest_possible
         else:
-            # For EOD, binary search back to find genesis
-            # Start from year 2000 (most exchanges have data from then)
-            oldest_start = int(datetime(2000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+            oldest_start = int(EODHD_EARLIEST_EOD_DATE.timestamp() * 1000)
 
-            # First try the oldest possible date
             candles = fetch_fn(oldest_start, now_ms)
             if candles:
                 return candles[0].timestamp
 
-            return None
+            return oldest_start

@@ -4,6 +4,7 @@ Bitfinex exchange adapter.
 API Documentation: https://docs.bitfinex.com/reference/rest-public-candles
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -26,11 +27,13 @@ class BitfinexAdapter(ExchangeAdapter):
     Note: Bitfinex uses close before high/low, which differs from standard OHLCV.
     """
 
-    @property
-    def name(self) -> str:
-        return "BITFINEX"
+    ADAPTER_NAME = "BITFINEX"
 
     @property
+    def name(self) -> str:
+        return self.ADAPTER_NAME
+
+    @functools.cached_property
     def config(self) -> AdapterConfig:
         return AdapterConfig(
             api_url=BITFINEX_API_URL,

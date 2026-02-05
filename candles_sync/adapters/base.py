@@ -171,6 +171,22 @@ class ExchangeAdapter(ABC):
         """
         pass
 
+    def build_fetch_params(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: int,
+        end: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build the complete set of query parameters for fetching candles.
+
+        Default implementation calls build_params(). Subclasses can override
+        to add symbol, interval, or other exchange-specific parameters.
+        """
+        return self.build_params(start, end, limit)
+
     def is_rate_limited(self, status_code: int) -> bool:
         """Check if a response status code indicates rate limiting."""
         return status_code in self.config.rate_limit.rate_limit_status_codes
