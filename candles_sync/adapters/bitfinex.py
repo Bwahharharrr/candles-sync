@@ -61,9 +61,10 @@ class BitfinexAdapter(ExchangeAdapter):
         Bitfinex trading pairs use 't' prefix (e.g., tBTCUSD).
         If symbol already has 't' prefix, return as-is.
         """
-        if symbol.startswith('t'):
-            return symbol
-        return f"t{symbol}"
+        normalized = (symbol or "").strip().upper()
+        if normalized.startswith("T"):
+            normalized = normalized[1:]
+        return f"t{normalized}"
 
     def build_url(self, symbol: str, timeframe: str) -> str:
         """Build Bitfinex candles URL."""

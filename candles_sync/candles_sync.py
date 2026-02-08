@@ -1115,7 +1115,10 @@ def _incremental_sync(
             latest = pd.read_csv(current_csv, usecols=["timestamp"])["timestamp"].astype(int).max()
             if not pd.isna(latest):
                 interval_ms = _get_interval_ms(timeframe)
-                refresh_start_ms = latest - interval_ms
+                refresh_start_ms = max(
+                    int(current_partition.start.timestamp() * 1000),
+                    latest - interval_ms
+                )
         except (OSError, ValueError, KeyError, pd.errors.EmptyDataError):
             log_warn(f"Could not read timestamp from {c_file(current_csv)}, using partition start")
 
@@ -1299,15 +1302,20 @@ def main() -> int:
     else:
         log_info(f"Synchronizing {target}")
 
-    ok = synchronize_candle_data(
-        exchange=exchange,
-        ticker=args.ticker,
-        timeframe=args.timeframe,
-        end_date_str=args.end,
-        verbose=args.verbose,
-        polling=args.polling,
-        debug=args.verbose,
-    )
+    try:
+        ok = synchronize_candle_data(
+            exchange=exchange,
+            ticker=args.ticker,
+            timeframe=args.timeframe,
+            end_date_str=args.end,
+            verbose=args.verbose,
+            polling=args.polling,
+            debug=args.verbose,
+        )
+    except Exception as e:
+        log_error(f"Synchronization failed: {e}")
+        return 1
+
     if ok:
         log_success("Synchronization completed.")
         return 0

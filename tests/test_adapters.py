@@ -68,6 +68,12 @@ class TestBitfinexAdapter:
     def test_format_symbol_already_prefixed(self, bitfinex):
         assert bitfinex.format_symbol("tBTCUSD") == "tBTCUSD"
 
+    def test_format_symbol_lowercase_normalized(self, bitfinex):
+        assert bitfinex.format_symbol("btcusd") == "tBTCUSD"
+
+    def test_format_symbol_uppercase_prefixed_normalized(self, bitfinex):
+        assert bitfinex.format_symbol("TBTCUSD") == "tBTCUSD"
+
     def test_build_url(self, bitfinex):
         url = bitfinex.build_url("tBTCUSD", "1h")
         assert url == "https://api-pub.bitfinex.com/v2/candles/trade:1h:tBTCUSD/hist"
