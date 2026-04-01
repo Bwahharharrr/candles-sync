@@ -346,8 +346,11 @@ def write_partition(df: pd.DataFrame, path: str) -> int:
     Merge new candles into existing file (if any) and write canonical CSV.
     Returns the delta (#rows in merged - #rows in old).
     """
-    if os.path.exists(path):
-        old = pd.read_csv(path, dtype=str)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        try:
+            old = pd.read_csv(path, dtype=str)
+        except pd.errors.EmptyDataError:
+            old = pd.DataFrame(columns=CSV_COLUMNS)
     else:
         old = pd.DataFrame(columns=CSV_COLUMNS)
 
@@ -520,7 +523,9 @@ def _create_empty_partitions(dir_path: str, tf: str, start_ms: int, end_ms: int,
     for p in Partition.all_between(tf, start_dt, end_dt):
         path = os.path.join(dir_path, f"{p.name}.csv")
         if not os.path.exists(path):
-            pd.DataFrame(columns=CSV_COLUMNS).to_csv(path, index=False)
+            tmp_path = path + ".tmp"
+            pd.DataFrame(columns=CSV_COLUMNS).to_csv(tmp_path, index=False)
+            os.replace(tmp_path, path)
             if not polling:
                 log_new(f"Empty partition created: {c_file(p.name)}")
 
