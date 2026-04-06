@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import decimal
+import fcntl
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -345,42 +347,69 @@ def write_partition(df: pd.DataFrame, path: str) -> int:
     """
     Merge new candles into existing file (if any) and write canonical CSV.
     Returns the delta (#rows in merged - #rows in old).
+
+    Process-safe: uses flock on a .lock file to serialize concurrent writes
+    from multiple live instances, and a unique temp file per process to
+    prevent the race where two processes share the same .tmp path.
     """
-    if os.path.exists(path) and os.path.getsize(path) > 0:
+    lock_path = path + ".lock"
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            old = pd.read_csv(path, dtype=str)
-        except pd.errors.EmptyDataError:
-            old = pd.DataFrame(columns=CSV_COLUMNS)
-    else:
-        old = pd.DataFrame(columns=CSV_COLUMNS)
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                try:
+                    old = pd.read_csv(path, dtype=str)
+                except pd.errors.EmptyDataError:
+                    old = pd.DataFrame(columns=CSV_COLUMNS)
+            else:
+                old = pd.DataFrame(columns=CSV_COLUMNS)
 
-    # Ensure correct columns, keep only expected
-    for col in CSV_COLUMNS:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype=str)
-        if col not in old.columns:
-            old[col] = pd.Series(dtype=str)
-    df = df[CSV_COLUMNS]
-    old = old[CSV_COLUMNS]
+            # Ensure correct columns, keep only expected
+            for col in CSV_COLUMNS:
+                if col not in df.columns:
+                    df[col] = pd.Series(dtype=str)
+                if col not in old.columns:
+                    old[col] = pd.Series(dtype=str)
+            df = df[CSV_COLUMNS]
+            old = old[CSV_COLUMNS]
 
-    merged = (
-        pd.concat([old, df], ignore_index=True)
-        .assign(timestamp=lambda x: pd.to_numeric(x.timestamp, errors="coerce"))
-        .dropna(subset=["timestamp"])
-        .astype({"timestamp": int})
-        .drop_duplicates(subset="timestamp", keep="last")
-        .sort_values("timestamp")
-    )
+            merged = (
+                pd.concat([old, df], ignore_index=True)
+                .assign(timestamp=lambda x: pd.to_numeric(x.timestamp, errors="coerce"))
+                .dropna(subset=["timestamp"])
+                .astype({"timestamp": int})
+                .drop_duplicates(subset="timestamp", keep="last")
+                .sort_values("timestamp")
+            )
 
-    # Canonical string representation
-    merged["timestamp"] = merged["timestamp"].astype(int)
-    for col in ["open", "close", "high", "low", "volume"]:
-        merged[col] = merged[col].apply(_canonical_num_str)
+            # Canonical string representation
+            merged["timestamp"] = merged["timestamp"].astype(int)
+            for col in ["open", "close", "high", "low", "volume"]:
+                merged[col] = merged[col].apply(_canonical_num_str)
 
-    tmp_path = path + ".tmp"
-    merged.to_csv(tmp_path, index=False)
-    os.replace(tmp_path, path)
-    return int(len(merged) - len(old))
+            # Use a unique temp file (PID + fd) to avoid race with other processes
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".tmp", dir=parent or ".",
+            )
+            try:
+                os.close(fd)
+                merged.to_csv(tmp_path, index=False)
+                os.replace(tmp_path, path)
+            except BaseException:
+                # Clean up temp file on any error
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            return int(len(merged) - len(old))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 def _read_last_timestamp_from_file(path: str) -> Optional[int]:
     """Read the last timestamp from a single CSV file. Returns None if file is empty/invalid."""
@@ -523,9 +552,17 @@ def _create_empty_partitions(dir_path: str, tf: str, start_ms: int, end_ms: int,
     for p in Partition.all_between(tf, start_dt, end_dt):
         path = os.path.join(dir_path, f"{p.name}.csv")
         if not os.path.exists(path):
-            tmp_path = path + ".tmp"
-            pd.DataFrame(columns=CSV_COLUMNS).to_csv(tmp_path, index=False)
-            os.replace(tmp_path, path)
+            fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=dir_path)
+            try:
+                os.close(fd)
+                pd.DataFrame(columns=CSV_COLUMNS).to_csv(tmp_path, index=False)
+                os.replace(tmp_path, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
             if not polling:
                 log_new(f"Empty partition created: {c_file(p.name)}")
 
